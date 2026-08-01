@@ -34,6 +34,8 @@ const GPROXY_MAGIC = Object.freeze({
 
 let isCompressing = false;
 let isRewriting = false;
+// 改写指令文本；非 null 时由拦截器以追加 user 消息的方式注入对话末尾
+let pendingRewriteInjection = null;
 
 // 改写输出格式说明（内部固定，不随用户提示词变化，保证可解析）
 const REWRITE_FORMAT_DIFF =
@@ -52,36 +54,41 @@ const REWRITE_FORMAT_FULL =
 
 const REWRITE_TOOL_REPAIR_PROMPT =
     'This is a formatting-repair task. Review the original assistant reply, the revision request, ' +
-    'and the draft edits produced by another model call. Submit the final edits through the ' +
-    'submit_edits tool. Every search value must be a character-for-character, unique excerpt from ' +
-    'the ORIGINAL REPLY; keep it as short as possible while remaining unique. Apply only changes ' +
-    'required by the REVISION REQUEST, and do not rewrite any other part of the reply.';
+    'and the draft edits produced by another model call. Submit the final edits via the ' +
+    'submit_edits tool (or, if no tool is available, output ONLY a JSON object of the form ' +
+    '{"edits": [{"search": "...", "replace": "..."}]}). Every search value must be a ' +
+    'character-for-character, unique excerpt from the ORIGINAL REPLY; keep it as short as ' +
+    'possible while remaining unique. Apply only changes required by the REVISION REQUEST, ' +
+    'and do not rewrite any other part of the reply.';
 
-const REWRITE_REPAIR_TOOL = Object.freeze({
-    type: 'function',
-    function: {
-        name: 'submit_edits',
-        description: 'Submit the final list of search-and-replace edits to apply to the assistant reply.',
-        parameters: {
-            type: 'object',
-            properties: {
-                edits: {
-                    type: 'array',
-                    items: {
-                        type: 'object',
-                        properties: {
-                            search: {
-                                type: 'string',
-                                description: 'Exact verbatim excerpt from the original reply, as short as possible while unique',
-                            },
-                            replace: { type: 'string' },
+// 修复请求走 ST 原生的 json_schema 通道（而不是自带 tools/tool_choice）：
+// claude 源后端会把它转成强制工具调用（tool_choice {type:'tool', name}），
+// openai/custom 源转成 response_format json_schema——各源都可用。
+// 注意：ST 的 claude 后端把 request.body.tool_choice 当字符串处理，
+// 自带 OpenAI 对象格式的 tool_choice 会被包坏成 {type:{...}} 导致 400。
+const REWRITE_REPAIR_SCHEMA = Object.freeze({
+    name: 'submit_edits',
+    description: 'Submit the final list of search-and-replace edits to apply to the assistant reply.',
+    strict: true,
+    value: {
+        type: 'object',
+        properties: {
+            edits: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    properties: {
+                        search: {
+                            type: 'string',
+                            description: 'Exact verbatim excerpt from the original reply, as short as possible while unique',
                         },
-                        required: ['search', 'replace'],
+                        replace: { type: 'string' },
                     },
+                    required: ['search', 'replace'],
                 },
             },
-            required: ['edits'],
         },
+        required: ['edits'],
     },
 });
 
@@ -206,28 +213,47 @@ function warnIfMergeRisk(s) {
 globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort, type) {
     try {
         const s = getSettings();
-        if (!s.enabled || s.cacheMode !== 'magic') return;
         if (!Array.isArray(chat) || chat.length === 0) return;
 
-        // 改写请求：Claude 只有在请求带缓存标记时才会查缓存，因此这里必须打一个断点。
-        // 打在最后一条 user 消息上——与上一轮的「输入消息」断点位置一致，前缀完全相同，
-        // 纯命中已有缓存、不产生新写入。不打在待改写的 assistant 消息上（它马上要变，写了也浪费）。
+        // —— 改写请求（须先于 enabled/cacheMode 检查：指令注入是改写功能的必要部分）——
+        // 1) 缓存断点：Claude 只有在请求带缓存标记时才会查缓存，因此这里必须打一个断点。
+        //    打在最后一条 user 消息上——与上一轮的「输入消息」断点位置一致，前缀完全相同，
+        //    纯命中已有缓存、不产生新写入。不打在待改写的 assistant 消息上（它马上要变，写了也浪费）。
+        // 2) 指令注入：改写指令以“追加的 user 消息”放在对话末尾，而不是走 quiet prompt。
+        //    ST 的 quiet prompt 固定以 system 角色注入在末尾；OpenAI 兼容源（如 gproxy 的
+        //    claudecode 后端）会把 system 上提，导致对话以 assistant 结尾，触发
+        //    “assistant prefill 不支持”400 错误。以 user 消息结尾对任何源都安全。
         if (isRewriting) {
-            for (let i = chat.length - 1; i >= 0; i--) {
-                const m = chat[i];
-                if (m && m.is_user === true && m.is_system !== true) {
-                    const marker = markerForTtl(s, s.bpInput.ttl);
-                    if (marker) {
-                        const clone = structuredClone(m);
-                        clone.mes = (clone.mes ?? '') + '\n' + marker;
-                        chat[i] = clone;
+            const useMarker = s.enabled && s.cacheMode === 'magic';
+            if (useMarker) {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    const m = chat[i];
+                    if (m && m.is_user === true && m.is_system !== true) {
+                        const marker = markerForTtl(s, s.bpInput.ttl);
+                        if (marker) {
+                            const clone = structuredClone(m);
+                            clone.mes = (clone.mes ?? '') + '\n' + marker;
+                            chat[i] = clone;
+                        }
+                        break;
                     }
-                    break;
                 }
+            }
+            if (pendingRewriteInjection) {
+                const ctx = SillyTavern.getContext();
+                chat.push({
+                    name: ctx?.name1 || 'User',
+                    is_user: true,
+                    is_system: false,
+                    send_date: ctx?.getMessageTimeStamp ? ctx.getMessageTimeStamp() : new Date().toISOString(),
+                    mes: pendingRewriteInjection,
+                    extra: {},
+                });
             }
             return;
         }
 
+        if (!s.enabled || s.cacheMode !== 'magic') return;
         if (isCompressing || type === 'quiet') return;
 
         warnIfMergeRisk(s);
@@ -537,8 +563,7 @@ async function requestRewriteToolRepair(ctx, original, instruction, draft) {
         }],
         chat_completion_source: source,
         max_tokens: 2048,
-        tools: [structuredClone(REWRITE_REPAIR_TOOL)],
-        tool_choice: { type: 'function', function: { name: 'submit_edits' } },
+        json_schema: structuredClone(REWRITE_REPAIR_SCHEMA),
     };
     if (model) payload.model = model;
     if (String(source ?? '').toLowerCase() === 'custom' && settings.custom_url) {
@@ -628,7 +653,7 @@ async function runRewrite(instruction) {
     const msg = chat[idx];
     const original = String(msg.mes ?? '');
 
-    const quietPrompt = [
+    const rewriteInstruction = [
         s.rewritePrompt,
         `Revision request: ${instruction}`,
         s.rewriteDiffMode ? REWRITE_FORMAT_DIFF : REWRITE_FORMAT_FULL,
@@ -637,9 +662,12 @@ async function runRewrite(instruction) {
     let result = '';
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
     isRewriting = true;
+    pendingRewriteInjection = rewriteInstruction;
     try {
-        // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史），指令注入在末尾，不破坏缓存前缀
-        result = await ctx.generateQuietPrompt({ quietPrompt });
+        // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
+        // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
+        // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
+        result = await ctx.generateQuietPrompt({ quietPrompt: '' });
     } catch (e) {
         console.error(LOG, '改写生成失败：', e);
         toastr.error('改写生成失败，详见控制台');
@@ -649,6 +677,7 @@ async function runRewrite(instruction) {
             if (loaderHandle) await loaderHandle.hide();
         } finally {
             isRewriting = false;
+            pendingRewriteInjection = null;
         }
     }
 
