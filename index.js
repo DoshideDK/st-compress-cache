@@ -50,6 +50,41 @@ const REWRITE_FORMAT_DIFF =
 const REWRITE_FORMAT_FULL =
     'Output ONLY the complete revised reply, with no preamble, no commentary, and no surrounding quotes.';
 
+const REWRITE_TOOL_REPAIR_PROMPT =
+    'This is a formatting-repair task. Review the original assistant reply, the revision request, ' +
+    'and the draft edits produced by another model call. Submit the final edits through the ' +
+    'submit_edits tool. Every search value must be a character-for-character, unique excerpt from ' +
+    'the ORIGINAL REPLY; keep it as short as possible while remaining unique. Apply only changes ' +
+    'required by the REVISION REQUEST, and do not rewrite any other part of the reply.';
+
+const REWRITE_REPAIR_TOOL = Object.freeze({
+    type: 'function',
+    function: {
+        name: 'submit_edits',
+        description: 'Submit the final list of search-and-replace edits to apply to the assistant reply.',
+        parameters: {
+            type: 'object',
+            properties: {
+                edits: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            search: {
+                                type: 'string',
+                                description: 'Exact verbatim excerpt from the original reply, as short as possible while unique',
+                            },
+                            replace: { type: 'string' },
+                        },
+                        required: ['search', 'replace'],
+                    },
+                },
+            },
+            required: ['edits'],
+        },
+    },
+});
+
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
 
@@ -67,6 +102,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 
     // —— 改写上一条 ——
     rewriteDiffMode: true,      // true：模型只输出改动片段（搜索替换块）；false：整条重写
+    rewriteToolRepair: true,    // 局部替换解析/匹配失败时，用独立工具调用修复格式
     rewritePrompt:
         'You are revising the latest assistant reply in the conversation above. Apply the ' +
         'revision request with the minimal necessary changes: keep the wording, style, ' +
@@ -367,6 +403,164 @@ async function runCompression(countOverride, { silent = false } = {}) {
 // ============================================================
 const DIFF_BLOCK_RE = /<{4,}\s*SEARCH\s*\r?\n([\s\S]*?)\r?\n={4,}\r?\n([\s\S]*?)\r?\n>{4,}\s*REPLACE/g;
 
+function parseDiffBlocks(text) {
+    return [...String(text ?? '').matchAll(DIFF_BLOCK_RE)]
+        .map((m) => ({ search: m[1], replace: m[2] }));
+}
+
+function normalizeToolEdits(edits) {
+    if (!Array.isArray(edits)) return null;
+    return edits
+        .filter((edit) => edit && typeof edit.search === 'string' && typeof edit.replace === 'string')
+        .map((edit) => ({ search: edit.search, replace: edit.replace }));
+}
+
+function parseToolArguments(value) {
+    if (value && typeof value === 'object') return value;
+    if (typeof value !== 'string') return null;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
+// 同时兼容 Anthropic 原生、OpenAI 兼容以及纯文本兜底响应。
+function extractToolEdits(data) {
+    if (data && Array.isArray(data.content)) {
+        for (const block of data.content) {
+            if (block?.type !== 'tool_use') continue;
+            const input = parseToolArguments(block.input);
+            const edits = normalizeToolEdits(input?.edits);
+            if (edits !== null) return edits;
+        }
+    }
+
+    const toolCalls = data?.choices?.[0]?.message?.tool_calls;
+    if (Array.isArray(toolCalls)) {
+        for (const call of toolCalls) {
+            const args = parseToolArguments(call?.function?.arguments);
+            const edits = normalizeToolEdits(args?.edits);
+            if (edits !== null) return edits;
+        }
+    }
+
+    const textCandidates = [];
+    if (typeof data === 'string') textCandidates.push(data);
+    if (typeof data?.content === 'string') textCandidates.push(data.content);
+    if (typeof data?.choices?.[0]?.message?.content === 'string') {
+        textCandidates.push(data.choices[0].message.content);
+    }
+    if (Array.isArray(data?.content)) {
+        for (const block of data.content) {
+            if (block?.type === 'text' && typeof block.text === 'string') textCandidates.push(block.text);
+        }
+    }
+
+    for (const candidate of textCandidates) {
+        const text = String(candidate).trim();
+        const unfenced = text.match(/^```(?:json)?\s*\n([\s\S]*?)\n?```$/i)?.[1] ?? text;
+        try {
+            const parsed = JSON.parse(unfenced);
+            const edits = normalizeToolEdits(parsed?.edits);
+            if (edits !== null) return edits;
+        } catch { /* 不是纯 JSON，继续尝试文本替换块 */ }
+
+        const blocks = parseDiffBlocks(text);
+        if (blocks.length > 0) return blocks;
+    }
+    return null;
+}
+
+function getRewriteRepairModel(settings, source) {
+    const modelFields = {
+        claude: 'claude_model',
+        openai: 'openai_model',
+        custom: 'custom_model',
+        makersuite: 'google_model',
+        google: 'google_model',
+        vertexai: 'vertexai_model',
+        openrouter: 'openrouter_model',
+        ai21: 'ai21_model',
+        mistralai: 'mistralai_model',
+        cohere: 'cohere_model',
+        perplexity: 'perplexity_model',
+        groq: 'groq_model',
+        electronhub: 'electronhub_model',
+        chutes: 'chutes_model',
+        nanogpt: 'nanogpt_model',
+        deepseek: 'deepseek_model',
+        aimlapi: 'aimlapi_model',
+        xai: 'xai_model',
+        pollinations: 'pollinations_model',
+        moonshot: 'moonshot_model',
+        fireworks: 'fireworks_model',
+        cometapi: 'cometapi_model',
+        azure_openai: 'azure_openai_model',
+        zai: 'zai_model',
+        siliconflow: 'siliconflow_model',
+        workers_ai: 'workers_ai_model',
+        minimax: 'minimax_model',
+    };
+    const field = modelFields[String(source ?? '').toLowerCase()];
+    return (field && settings?.[field]) || settings?.model || '';
+}
+
+function buildRewriteRepairPrompt(original, instruction, draft) {
+    return [
+        REWRITE_TOOL_REPAIR_PROMPT,
+        '--- ORIGINAL REPLY ---',
+        original,
+        '--- REVISION REQUEST ---',
+        instruction,
+        '--- DRAFT EDITS ---',
+        draft,
+        '--- END INPUT ---',
+    ].join('\n\n');
+}
+
+async function requestRewriteToolRepair(ctx, original, instruction, draft) {
+    const service = ctx.ChatCompletionService;
+    if (!service || typeof service.processRequest !== 'function') {
+        console.warn(LOG, '当前 SillyTavern 版本未提供 ChatCompletionService，跳过结构化改写修复');
+        return null;
+    }
+
+    const settings = ctx.chatCompletionSettings || {};
+    const source = settings.chat_completion_source;
+    const model = getRewriteRepairModel(settings, source);
+    const payload = {
+        stream: false,
+        messages: [{
+            role: 'user',
+            content: buildRewriteRepairPrompt(original, instruction, draft),
+        }],
+        chat_completion_source: source,
+        max_tokens: 2048,
+        tools: [structuredClone(REWRITE_REPAIR_TOOL)],
+        tool_choice: { type: 'function', function: { name: 'submit_edits' } },
+    };
+    if (model) payload.model = model;
+    if (String(source ?? '').toLowerCase() === 'custom' && settings.custom_url) {
+        payload.custom_url = settings.custom_url;
+    }
+    if (settings.reverse_proxy) payload.reverse_proxy = settings.reverse_proxy;
+    if (settings.proxy_password) payload.proxy_password = settings.proxy_password;
+
+    try {
+        // 独立自定义请求不经过 generate 拦截器管线，因此不会带魔法字符串缓存标记，
+        // 也不会改变主对话的严格缓存前缀；请求本身只含上面的三段修复材料。
+        let data = await service.processRequest(payload, {}, false);
+        if (data && typeof data.json === 'function') data = await data.json();
+        const edits = extractToolEdits(data);
+        if (edits === null) console.warn(LOG, '结构化修复响应中未解析出 edits：', data);
+        return edits;
+    } catch (e) {
+        console.warn(LOG, '结构化改写修复调用失败，退回第一段结果：', e);
+        return null;
+    }
+}
+
 function findLastAssistantIndex(chat) {
     for (let i = chat.length - 1; i >= 0; i--) {
         const m = chat[i];
@@ -391,6 +585,16 @@ function applySearchReplace(text, search, replace) {
         if (re.test(text)) return text.replace(re, () => replace);
     } catch { /* 正则构造失败则视为未匹配 */ }
     return null;
+}
+
+function applyEditBlocks(original, blocks) {
+    let text = original, ok = 0, fail = 0;
+    for (const block of blocks) {
+        const applied = applySearchReplace(text, block.search, block.replace);
+        if (applied === null) fail++;
+        else { text = applied; ok++; }
+    }
+    return { text, ok, fail };
 }
 
 // 整条重写模式下，剥掉模型可能包裹的代码围栏
@@ -441,8 +645,11 @@ async function runRewrite(instruction) {
         toastr.error('改写生成失败，详见控制台');
         return false;
     } finally {
-        isRewriting = false;
-        if (loaderHandle) await loaderHandle.hide();
+        try {
+            if (loaderHandle) await loaderHandle.hide();
+        } finally {
+            isRewriting = false;
+        }
     }
 
     result = String(result ?? '').trim();
@@ -452,25 +659,51 @@ async function runRewrite(instruction) {
     }
 
     let newText;
+    let repaired = false;
     if (s.rewriteDiffMode) {
-        const blocks = [...result.matchAll(DIFF_BLOCK_RE)].map((m) => ({ search: m[1], replace: m[2] }));
-        if (blocks.length === 0) {
+        const blocks = parseDiffBlocks(result);
+        const firstPass = applyEditBlocks(original, blocks);
+        let finalPass = firstPass;
+
+        // 第一段只要有一个块解析/匹配失败，便从原文重新应用工具修复的完整 edits；
+        // 全部成功时不发第二段请求，以节省 token 和延迟。
+        if (s.rewriteToolRepair && (blocks.length === 0 || firstPass.fail > 0)) {
+            const repairLoader = ctx.loader ? ctx.loader.show({ message: '正在结构化修复改写结果…' }) : null;
+            isRewriting = true;
+            try {
+                const edits = await requestRewriteToolRepair(ctx, original, instruction, result);
+                if (edits !== null) {
+                    const repairPass = applyEditBlocks(original, edits);
+                    // 修复结果反而全部失配时，保留第一段的部分成果
+                    if (repairPass.ok > 0 || firstPass.ok === 0) {
+                        finalPass = repairPass;
+                        repaired = true;
+                    } else {
+                        console.warn(LOG, '结构化修复的 edits 全部失配，沿用第一段结果');
+                    }
+                }
+            } finally {
+                try {
+                    if (repairLoader) await repairLoader.hide();
+                } finally {
+                    isRewriting = false;
+                }
+            }
+        }
+
+        if (!repaired && blocks.length === 0) {
             console.warn(LOG, '未解析出替换块，模型原始输出：', result);
             toastr.error('改写失败：未能从模型输出中解析出替换块（原文未改动，详见控制台）');
             return false;
         }
-        let text = original, ok = 0, fail = 0;
-        for (const b of blocks) {
-            const applied = applySearchReplace(text, b.search, b.replace);
-            if (applied === null) fail++;
-            else { text = applied; ok++; }
-        }
-        if (ok === 0) {
+        if (finalPass.ok === 0) {
             toastr.error('改写失败：所有替换块都与原文不匹配（原文未改动）');
             return false;
         }
-        if (fail > 0) toastr.warning(`有 ${fail} 个替换块未匹配到原文，已应用其余 ${ok} 个`);
-        newText = text;
+        if (finalPass.fail > 0) {
+            toastr.warning(`有 ${finalPass.fail} 个替换块未匹配到原文，已应用其余 ${finalPass.ok} 个`);
+        }
+        newText = finalPass.text;
     } else {
         newText = stripCodeFence(result);
     }
@@ -524,7 +757,9 @@ async function runRewrite(instruction) {
         console.warn(LOG, 'saveChat 失败：', e);
     }
 
-    toastr.success(s.rewriteDiffMode ? '改写完成（原文已存为 swipe，可左滑找回）' : '已整条重写（原文已存为 swipe）');
+    toastr.success(s.rewriteDiffMode
+        ? `改写完成${repaired ? '（经工具修复）' : ''}（原文已存为 swipe，可左滑找回）`
+        : '已整条重写（原文已存为 swipe）');
     return true;
 }
 
@@ -687,6 +922,11 @@ function buildSettingsHtml() {
             <span>局部替换模式（模型只输出改动片段，省 token、不动其余部分；关闭则整条重写）</span>
           </label>
 
+          <label class="checkbox_label" for="cc_rw_repair">
+            <input id="cc_rw_repair" type="checkbox" />
+            <span>解析失败时用独立工具调用修复（不影响缓存）</span>
+          </label>
+
           <label for="cc_rw_prompt">改写提示词</label>
           <textarea id="cc_rw_prompt" class="text_pole textarea_compact" rows="4"></textarea>
           <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。改写请求只重算最后一条回复，其余前缀命中缓存。</small>
@@ -756,6 +996,7 @@ function refreshUI() {
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
     $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
+    $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
     $('#cc_rw_prompt').val(s.rewritePrompt);
     $('#cc_mode').val(s.cacheMode);
     $('#cc_bp1_en').prop('checked', s.bpCompression.enabled);
@@ -781,6 +1022,7 @@ function bindUI() {
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
     $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
+    $('#cc_rw_repair').on('change', function () { s.rewriteToolRepair = $(this).prop('checked'); save(); });
     $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
 
     $('#cc_mode').on('change', function () { s.cacheMode = String($(this).val()); save(); });
