@@ -34,8 +34,8 @@ const GPROXY_MAGIC = Object.freeze({
 
 let isCompressing = false;
 let isRewriting = false;
-// 改写指令文本；非 null 时由拦截器以追加 user 消息的方式注入对话末尾
-let pendingRewriteInjection = null;
+// 使用主路径预设时，由拦截器以追加 user 消息的方式注入任务指令
+let pendingTaskInjection = null;
 
 // 改写输出格式说明（内部固定，不随用户提示词变化，保证可解析）
 const REWRITE_FORMAT_DIFF =
@@ -96,6 +96,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
 
     // —— 压缩 ——
+    compressUseMainPreset: false, // 开启时使用主路径的预设、世界书和聊天上下文
     compressPrompt:
         'You are a context compressor for a roleplay chat. Faithfully compress the ' +
         'conversation below into one concise memory summary. Preserve key plot points, ' +
@@ -108,6 +109,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     summaryPrefix: '【压缩记忆】\n',
 
     // —— 改写上一条 ——
+    rewriteUseMainPreset: true, // 默认保留完整主路径；关闭时仅发送可见聊天和改写指令
     rewriteDiffMode: true,      // true：模型只输出改动片段（搜索替换块）；false：整条重写
     rewriteToolRepair: true,    // 局部替换解析/匹配失败时，用独立工具调用修复格式
     rewritePrompt:
@@ -213,18 +215,19 @@ function warnIfMergeRisk(s) {
 globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort, type) {
     try {
         const s = getSettings();
-        if (!Array.isArray(chat) || chat.length === 0) return;
+        if (!Array.isArray(chat)) return;
 
-        // —— 改写请求（须先于 enabled/cacheMode 检查：指令注入是改写功能的必要部分）——
-        // 1) 缓存断点：Claude 只有在请求带缓存标记时才会查缓存，因此这里必须打一个断点。
+        // —— 使用主路径的任务（须先于 enabled/cacheMode 检查：任务指令必须注入）——
+        // 1) 改写缓存断点：Claude 只有在请求带缓存标记时才会查缓存，因此改写时打一个断点。
         //    打在最后一条 user 消息上——与上一轮的「输入消息」断点位置一致，前缀完全相同，
         //    纯命中已有缓存、不产生新写入。不打在待改写的 assistant 消息上（它马上要变，写了也浪费）。
-        // 2) 指令注入：改写指令以“追加的 user 消息”放在对话末尾，而不是走 quiet prompt。
+        // 2) 指令注入：任务指令以“追加的 user 消息”放在对话末尾，而不是走 quiet prompt。
         //    ST 的 quiet prompt 固定以 system 角色注入在末尾；OpenAI 兼容源（如 gproxy 的
         //    claudecode 后端）会把 system 上提，导致对话以 assistant 结尾，触发
         //    “assistant prefill 不支持”400 错误。以 user 消息结尾对任何源都安全。
-        if (isRewriting) {
-            const useMarker = s.enabled && s.cacheMode === 'magic';
+        if ((isRewriting || isCompressing) && pendingTaskInjection) {
+            // 压缩走主路径时仍不添加缓存断点。
+            const useMarker = isRewriting && s.enabled && s.cacheMode === 'magic';
             if (useMarker) {
                 for (let i = chat.length - 1; i >= 0; i--) {
                     const m = chat[i];
@@ -239,22 +242,20 @@ globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort
                     }
                 }
             }
-            if (pendingRewriteInjection) {
-                const ctx = SillyTavern.getContext();
-                chat.push({
-                    name: ctx?.name1 || 'User',
-                    is_user: true,
-                    is_system: false,
-                    send_date: ctx?.getMessageTimeStamp ? ctx.getMessageTimeStamp() : new Date().toISOString(),
-                    mes: pendingRewriteInjection,
-                    extra: {},
-                });
-            }
+            const ctx = SillyTavern.getContext();
+            chat.push({
+                name: ctx?.name1 || 'User',
+                is_user: true,
+                is_system: false,
+                send_date: ctx?.getMessageTimeStamp ? ctx.getMessageTimeStamp() : new Date().toISOString(),
+                mes: pendingTaskInjection,
+                extra: {},
+            });
             return;
         }
 
         if (!s.enabled || s.cacheMode !== 'magic') return;
-        if (isCompressing || type === 'quiet') return;
+        if (isCompressing || isRewriting || type === 'quiet') return;
 
         warnIfMergeRisk(s);
 
@@ -322,8 +323,8 @@ function collectTargets(countOverride) {
 //  压缩执行
 // ============================================================
 async function runCompression(countOverride, { silent = false } = {}) {
-    if (isCompressing) {
-        if (!silent) toastr.warning('已有压缩任务在进行中');
+    if (isCompressing || isRewriting) {
+        if (!silent) toastr.warning('已有任务在进行中');
         return;
     }
     const ctx = SillyTavern.getContext();
@@ -346,16 +347,28 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在压缩上下文…' }) : null;
     isCompressing = true;
     try {
-        result = await ctx.generateRaw({
-            systemPrompt: s.compressPrompt,
-            prompt: transcript,
-        });
+        if (s.compressUseMainPreset) {
+            pendingTaskInjection = [
+                s.compressPrompt,
+                'Summarize ONLY the conversation excerpt below. Use the preceding context only as background. Output only the summary.',
+                '--- CONVERSATION TO COMPRESS ---',
+                transcript,
+                '--- END CONVERSATION ---',
+            ].join('\n\n');
+            result = await ctx.generateQuietPrompt({ quietPrompt: '' });
+        } else {
+            result = await ctx.generateRaw({
+                systemPrompt: s.compressPrompt,
+                prompt: transcript,
+            });
+        }
     } catch (e) {
         console.error(LOG, '压缩生成失败：', e);
         if (!silent) toastr.error('压缩生成失败，详见控制台');
         return;
     } finally {
         isCompressing = false;
+        pendingTaskInjection = null;
         if (loaderHandle) await loaderHandle.hide();
     }
 
@@ -662,12 +675,21 @@ async function runRewrite(instruction) {
     let result = '';
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
     isRewriting = true;
-    pendingRewriteInjection = rewriteInstruction;
     try {
         // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
         // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
         // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
-        result = await ctx.generateQuietPrompt({ quietPrompt: '' });
+        if (s.rewriteUseMainPreset) {
+            pendingTaskInjection = rewriteInstruction;
+            result = await ctx.generateQuietPrompt({ quietPrompt: '' });
+        } else {
+            const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
+                role: m.is_user ? 'user' : 'assistant',
+                content: String(m.mes ?? ''),
+            }));
+            messages.push({ role: 'user', content: rewriteInstruction });
+            result = await ctx.generateRaw({ prompt: messages });
+        }
     } catch (e) {
         console.error(LOG, '改写生成失败：', e);
         toastr.error('改写生成失败，详见控制台');
@@ -677,7 +699,7 @@ async function runRewrite(instruction) {
             if (loaderHandle) await loaderHandle.hide();
         } finally {
             isRewriting = false;
-            pendingRewriteInjection = null;
+            pendingTaskInjection = null;
         }
     }
 
@@ -921,7 +943,13 @@ function buildSettingsHtml() {
           <hr>
           <h4>压缩参数</h4>
 
-          <label for="cc_prompt">压缩提示词（system）</label>
+          <label class="checkbox_label" for="cc_compress_main_preset">
+            <input id="cc_compress_main_preset" type="checkbox" />
+            <span>使用主路径预设</span>
+          </label>
+          <small class="notes">开启后带上当前主对话的预设、世界书和上下文，仍只压缩选定范围；关闭时仅发送压缩提示词和待压缩消息。默认关闭。</small>
+
+          <label for="cc_prompt">压缩提示词</label>
           <textarea id="cc_prompt" class="text_pole textarea_compact" rows="5"></textarea>
 
           <div class="flex-container">
@@ -946,6 +974,12 @@ function buildSettingsHtml() {
           <hr>
           <h4>改写上一条</h4>
 
+          <label class="checkbox_label" for="cc_rw_main_preset">
+            <input id="cc_rw_main_preset" type="checkbox" />
+            <span>使用主路径预设</span>
+          </label>
+          <small class="notes">开启后带上当前主对话的预设、世界书和上下文，并复用主对话缓存；关闭时仅发送未隐藏的聊天内容和改写指令，不添加主对话缓存断点。默认开启。</small>
+
           <label class="checkbox_label" for="cc_rw_diff">
             <input id="cc_rw_diff" type="checkbox" />
             <span>局部替换模式（模型只输出改动片段，省 token、不动其余部分；关闭则整条重写）</span>
@@ -958,7 +992,7 @@ function buildSettingsHtml() {
 
           <label for="cc_rw_prompt">改写提示词</label>
           <textarea id="cc_rw_prompt" class="text_pole textarea_compact" rows="4"></textarea>
-          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。改写请求只重算最后一条回复，其余前缀命中缓存。</small>
+          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。使用主路径预设时可复用已有缓存前缀。</small>
 
           <hr>
           <h4>缓存断点（gproxy 魔法字符串）</h4>
@@ -1020,10 +1054,12 @@ function refreshUI() {
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_auto').prop('checked', s.autoMode);
     $('#cc_auto_every').val(s.autoEvery);
+    $('#cc_compress_main_preset').prop('checked', s.compressUseMainPreset);
     $('#cc_prompt').val(s.compressPrompt);
     $('#cc_role').val(s.compressRole);
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
+    $('#cc_rw_main_preset').prop('checked', s.rewriteUseMainPreset);
     $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
     $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
     $('#cc_rw_prompt').val(s.rewritePrompt);
@@ -1046,10 +1082,12 @@ function bindUI() {
     $('#cc_enabled').on('change', function () { s.enabled = $(this).prop('checked'); save(); });
     $('#cc_auto').on('change', function () { s.autoMode = $(this).prop('checked'); save(); refreshCounterDisplay(); });
     $('#cc_auto_every').on('input', function () { s.autoEvery = Math.max(1, parseInt($(this).val()) || 10); save(); refreshCounterDisplay(); });
+    $('#cc_compress_main_preset').on('change', function () { s.compressUseMainPreset = $(this).prop('checked'); save(); });
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
+    $('#cc_rw_main_preset').on('change', function () { s.rewriteUseMainPreset = $(this).prop('checked'); save(); });
     $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
     $('#cc_rw_repair').on('change', function () { s.rewriteToolRepair = $(this).prop('checked'); save(); });
     $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
