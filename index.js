@@ -8,10 +8,12 @@
  *     - 自动模式：用户每发送 N 条消息（编辑重发不计入），在当次回复结束后
  *       自动压缩上次压缩点之后的消息。自动模式开启时仍可随时手动压缩。
  *     触发入口：设置面板按钮、输入框旁“选项”菜单（重新生成/AI帮答/续写 同级）、/compress 命令。
+ *     可设置“保留最近 N 条不压缩”，摘要插在这些消息之前。
  *  2) 改写上一条：在输入框写下改写要求，点“选项”菜单里的「改写上一条」或
  *     /rewrite 命令，对最后一条 AI 回复做局部改写（搜索替换块）或整条重写。
  *     指令不进存档；原文保存为 swipe；请求命中已有缓存前缀（只在最后一条
- *     user 消息打断点，与上一轮位置一致，纯命中、零新写入）。
+ *     user 消息打断点，与上一轮位置一致，纯命中、零新写入）。整条重写可流式输出。
+ *     压缩和改写都可指定一个 Chat Completion 预设，执行期间临时切换、结束后切回。
  *  3) 三组缓存断点（TTL 可配）：
  *       - 上次压缩结果所在的消息（默认关闭）
  *       - 倒数第一条 assistant 消息
@@ -97,6 +99,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 
     // —— 压缩 ——
     compressUseMainPreset: false, // 开启时使用主路径的预设、世界书和聊天上下文
+    compressPreset: '',           // 压缩时临时切换到的 Chat Completion 预设；空为跟随当前
     compressPrompt:
         'You are a context compressor for a roleplay chat. Faithfully compress the ' +
         'conversation below into one concise memory summary. Preserve key plot points, ' +
@@ -106,12 +109,15 @@ const DEFAULT_SETTINGS = Object.freeze({
         'preamble and no explanations.',
     compressRole: 'assistant',  // 摘要写回时的角色：assistant / user
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
+    compressKeepLast: 0,        // 倒数 N 条消息不参与压缩（摘要插在它们之前）
     summaryPrefix: '【压缩记忆】\n',
 
     // —— 改写上一条 ——
     rewriteUseMainPreset: true, // 默认保留完整主路径；关闭时仅发送可见聊天和改写指令
+    rewritePreset: '',          // 改写时临时切换到的 Chat Completion 预设；空为跟随当前
     rewriteDiffMode: true,      // true：模型只输出改动片段（搜索替换块）；false：整条重写
-    rewriteToolRepair: true,    // 局部替换解析/匹配失败时，用独立工具调用修复格式
+    rewriteToolRepair: true,    // 局部替换解析/匹配失败时，用独立工具调用修复
+    rewriteStream: true,        // 整条重写时流式输出，边生成边显示在原消息上格式
     rewritePrompt:
         'You are revising the latest assistant reply in the conversation above. Apply the ' +
         'revision request with the minimal necessary changes: keep the wording, style, ' +
@@ -289,19 +295,59 @@ globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort
 };
 
 // ============================================================
+//  临时切换预设
+// ============================================================
+// 在 fn 执行期间临时切到指定的 Chat Completion 预设，结束后切回原预设。
+// 预设切换会重新应用预设文件里保存的值：当前预设未保存的改动在切回后会丢失。
+// 若开启了“预设绑定连接”，所选预设里的源/模型也会一并生效。
+async function withPreset(presetName, fn) {
+    const ctx = SillyTavern.getContext();
+    if (!presetName || ctx.mainApi !== 'openai') return await fn();
+    const pm = typeof ctx.getPresetManager === 'function' ? ctx.getPresetManager('openai') : null;
+    if (!pm) return await fn();
+    if (pm.getSelectedPresetName() === presetName) return await fn();
+
+    const target = pm.findPreset(presetName);
+    if (target === undefined) {
+        toastr.warning(`找不到预设「${presetName}」，改用当前预设`);
+        return await fn();
+    }
+    const original = pm.getSelectedPreset();
+    await pm.selectPreset(target);
+    try {
+        return await fn();
+    } finally {
+        try {
+            await pm.selectPreset(original);
+        } catch (e) {
+            console.error(LOG, '切回原预设失败：', e);
+            toastr.error('切回原预设失败，请手动检查当前预设');
+        }
+    }
+}
+
+// ============================================================
 //  压缩范围选择
 // ============================================================
 // countOverride 为数字时：取最近 N 条可压缩消息（旧行为）。
 // 否则：取“上一次压缩摘要之后”的全部可压缩消息；没有摘要则取全部。
-function collectTargets(countOverride) {
+// keepLast > 0 时，最后 keepLast 条可压缩消息始终保留、不参与压缩。
+function collectTargets(countOverride, keepLast = 0) {
     const chat = SillyTavern.getContext().chat;
     if (!Array.isArray(chat) || chat.length === 0) return [];
 
     const eligible = (m) => m && m.is_system !== true && !isSummaryMessage(m);
 
+    let skip = Math.max(0, Math.floor(Number(keepLast) || 0));
+    let end = chat.length; // 目标范围的开区间上界
+    for (let i = chat.length - 1; i >= 0 && skip > 0; i--) {
+        if (eligible(chat[i])) { skip--; end = i; }
+    }
+    if (skip > 0) return [];
+
     if (Number.isFinite(countOverride) && countOverride > 0) {
         const targets = [];
-        for (let i = chat.length - 1; i >= 0 && targets.length < countOverride; i--) {
+        for (let i = end - 1; i >= 0 && targets.length < countOverride; i--) {
             if (eligible(chat[i])) targets.push(i);
         }
         targets.reverse();
@@ -313,7 +359,7 @@ function collectTargets(countOverride) {
         if (isSummaryMessage(chat[i])) { lastSummary = i; break; }
     }
     const targets = [];
-    for (let i = lastSummary + 1; i < chat.length; i++) {
+    for (let i = lastSummary + 1; i < end; i++) {
         if (eligible(chat[i])) targets.push(i);
     }
     return targets;
@@ -331,9 +377,14 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const s = getSettings();
     const chat = ctx.chat;
 
-    const targets = collectTargets(countOverride);
+    const keepLast = Math.max(0, Math.floor(Number(s.compressKeepLast) || 0));
+    const targets = collectTargets(countOverride, keepLast);
     if (targets.length === 0) {
-        if (!silent) toastr.warning('上次压缩之后没有新消息可压缩');
+        if (!silent) {
+            toastr.warning(keepLast > 0
+                ? `上次压缩之后没有新消息可压缩（最近 ${keepLast} 条保留不压缩）`
+                : '上次压缩之后没有新消息可压缩');
+        }
         return;
     }
 
@@ -347,21 +398,22 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在压缩上下文…' }) : null;
     isCompressing = true;
     try {
-        if (s.compressUseMainPreset) {
-            pendingTaskInjection = [
-                s.compressPrompt,
-                'Summarize ONLY the conversation excerpt below. Use the preceding context only as background. Output only the summary.',
-                '--- CONVERSATION TO COMPRESS ---',
-                transcript,
-                '--- END CONVERSATION ---',
-            ].join('\n\n');
-            result = await ctx.generateQuietPrompt({ quietPrompt: '' });
-        } else {
-            result = await ctx.generateRaw({
+        result = await withPreset(s.compressPreset, async () => {
+            if (s.compressUseMainPreset) {
+                pendingTaskInjection = [
+                    s.compressPrompt,
+                    'Summarize ONLY the conversation excerpt below. Use the preceding context only as background. Output only the summary.',
+                    '--- CONVERSATION TO COMPRESS ---',
+                    transcript,
+                    '--- END CONVERSATION ---',
+                ].join('\n\n');
+                return await ctx.generateQuietPrompt({ quietPrompt: '' });
+            }
+            return await ctx.generateRaw({
                 systemPrompt: s.compressPrompt,
                 prompt: transcript,
             });
-        }
+        });
     } catch (e) {
         console.error(LOG, '压缩生成失败：', e);
         if (!silent) toastr.error('压缩生成失败，详见控制台');
@@ -388,6 +440,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
         extra: { [MODULE_NAME]: { isCompression: true, ts: Date.now() } },
     };
 
+    let needReload = false;
     if (s.hideOriginals) {
         // 按连续区间分组隐藏，避免 min-max 整段误伤夹在中间的非目标消息（如上一条摘要）
         const runs = [];
@@ -412,20 +465,37 @@ async function runCompression(countOverride, { silent = false } = {}) {
         }
         if (!hid) {
             for (const i of targets) chat[i].is_system = true;
-            if (ctx.reloadCurrentChat) await ctx.reloadCurrentChat();
+            needReload = true;
         }
     }
 
-    chat.push(newMsg);
-    try {
-        if (ctx.addOneMessage) ctx.addOneMessage(newMsg);
-    } catch (e) {
-        console.warn(LOG, 'addOneMessage 失败：', e);
+    // 保留了最近几条时，摘要插在被压缩范围之后、保留消息之前，保证时间顺序
+    const insertAt = keepLast > 0 ? targets[targets.length - 1] + 1 : chat.length;
+    if (insertAt < chat.length) {
+        chat.splice(insertAt, 0, newMsg);
+        needReload = true;
+    } else {
+        chat.push(newMsg);
+        if (!needReload) {
+            try {
+                if (ctx.addOneMessage) ctx.addOneMessage(newMsg);
+            } catch (e) {
+                console.warn(LOG, 'addOneMessage 失败：', e);
+            }
+        }
     }
     try {
         if (ctx.saveChat) await ctx.saveChat();
     } catch (e) {
         console.warn(LOG, 'saveChat 失败：', e);
+    }
+    // reloadCurrentChat 从服务端重新读取，必须在保存之后
+    if (needReload) {
+        try {
+            if (ctx.reloadCurrentChat) await ctx.reloadCurrentChat();
+        } catch (e) {
+            console.warn(LOG, '刷新聊天失败：', e);
+        }
     }
 
     // 压缩完成后重置用户输入计数
@@ -558,6 +628,20 @@ function buildRewriteRepairPrompt(original, instruction, draft) {
     ].join('\n\n');
 }
 
+// 独立请求所需的连接参数（源、模型、自定义地址、反代），与主对话当前连接一致
+function buildConnectionPayload(settings) {
+    const source = settings.chat_completion_source;
+    const model = getRewriteRepairModel(settings, source);
+    const payload = { chat_completion_source: source };
+    if (model) payload.model = model;
+    if (String(source ?? '').toLowerCase() === 'custom' && settings.custom_url) {
+        payload.custom_url = settings.custom_url;
+    }
+    if (settings.reverse_proxy) payload.reverse_proxy = settings.reverse_proxy;
+    if (settings.proxy_password) payload.proxy_password = settings.proxy_password;
+    return payload;
+}
+
 async function requestRewriteToolRepair(ctx, original, instruction, draft) {
     const service = ctx.ChatCompletionService;
     if (!service || typeof service.processRequest !== 'function') {
@@ -565,25 +649,16 @@ async function requestRewriteToolRepair(ctx, original, instruction, draft) {
         return null;
     }
 
-    const settings = ctx.chatCompletionSettings || {};
-    const source = settings.chat_completion_source;
-    const model = getRewriteRepairModel(settings, source);
     const payload = {
+        ...buildConnectionPayload(ctx.chatCompletionSettings || {}),
         stream: false,
         messages: [{
             role: 'user',
             content: buildRewriteRepairPrompt(original, instruction, draft),
         }],
-        chat_completion_source: source,
         max_tokens: 2048,
         json_schema: structuredClone(REWRITE_REPAIR_SCHEMA),
     };
-    if (model) payload.model = model;
-    if (String(source ?? '').toLowerCase() === 'custom' && settings.custom_url) {
-        payload.custom_url = settings.custom_url;
-    }
-    if (settings.reverse_proxy) payload.reverse_proxy = settings.reverse_proxy;
-    if (settings.proxy_password) payload.proxy_password = settings.proxy_password;
 
     try {
         // 独立自定义请求不经过 generate 拦截器管线，因此不会带魔法字符串缓存标记，
@@ -641,6 +716,117 @@ function stripCodeFence(text) {
     return m ? m[1] : text;
 }
 
+// ST 的 quiet 生成不支持流式。主路径流式改写的做法：照常走 quiet 生成，让 ST 构建完整请求体
+// （预设参数、世界书、拦截器注入的改写指令与缓存断点都已就位），在 CHAT_COMPLETION_SETTINGS_READY
+// 时捕获请求体并调用 stopGeneration()——它同步中止 quiet 请求所用的全局 abortController，
+// 随后的 fetch 以已中止的信号立即失败，不会发出网络请求；再由我们以 stream:true 重发同一请求体。
+// 非 Chat Completion API（没触发该事件）时 body 为 null，直接沿用 quiet 生成的结果。
+async function captureMainPathRequest(ctx) {
+    const { eventSource, event_types } = ctx;
+    const eventName = event_types.CHAT_COMPLETION_SETTINGS_READY;
+    let body = null;
+    const listener = (data) => {
+        if (body || !isRewriting) return;
+        body = JSON.parse(JSON.stringify(data));
+        ctx.stopGeneration();
+    };
+    // 最后执行，确保拿到其他扩展修改后的请求体
+    if (typeof eventSource.makeLast === 'function') eventSource.makeLast(eventName, listener);
+    else eventSource.on(eventName, listener);
+
+    let fallback = '';
+    try {
+        fallback = await ctx.generateQuietPrompt({ quietPrompt: '' });
+    } catch (e) {
+        if (!body) throw e; // 捕获后的中止错误是预期内的
+    } finally {
+        eventSource.removeListener(eventName, listener);
+    }
+    return { body, fallback };
+}
+
+// 以流式发送请求体，每收到一段就用累计文本回调 onText，返回最终文本
+async function streamChatCompletion(ctx, body, signal, onText) {
+    const generator = await ctx.ChatCompletionService.sendRequest({ ...body, stream: true }, true, signal);
+    let text = '';
+    for await (const chunk of generator()) {
+        if (typeof chunk?.text === 'string') text = chunk.text;
+        onText(text);
+    }
+    return text;
+}
+
+// 流式过程中只刷新消息 DOM，不改 chat 数据；最终结果由调用方写回
+function createStreamRenderer(ctx, idx, msg) {
+    let pending = null, scheduled = false;
+    return (text) => {
+        pending = text;
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => {
+            scheduled = false;
+            try {
+                const $text = $(`#chat .mes[mesid="${idx}"] .mes_text`);
+                if ($text.length) {
+                    $text.html(ctx.messageFormatting(stripCodeFence(pending), msg.name, false, false, idx));
+                }
+            } catch { /* 渲染失败不影响生成 */ }
+        });
+    };
+}
+
+async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction) {
+    const msg = chat[idx];
+    const controller = new AbortController();
+    const render = createStreamRenderer(ctx, idx, msg);
+    const $toast = toastr.info('正在流式改写…（点此停止）', '', {
+        timeOut: 0,
+        extendedTimeOut: 0,
+        tapToDismiss: false,
+        onclick: () => controller.abort(),
+    });
+    let started = false;
+    try {
+        let body;
+        if (s.rewriteUseMainPreset) {
+            pendingTaskInjection = rewriteInstruction;
+            const captured = await captureMainPathRequest(ctx);
+            pendingTaskInjection = null;
+            if (!captured.body) return String(captured.fallback ?? '');
+            body = captured.body;
+        } else {
+            const settings = ctx.chatCompletionSettings || {};
+            const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
+                role: m.is_user ? 'user' : 'assistant',
+                content: String(m.mes ?? ''),
+            }));
+            messages.push({ role: 'user', content: rewriteInstruction });
+            body = {
+                ...buildConnectionPayload(settings),
+                messages,
+                max_tokens: settings.openai_max_tokens,
+                temperature: Number(settings.temp_openai),
+                custom_prompt_post_processing: settings.custom_prompt_post_processing,
+            };
+        }
+        started = true;
+        return await streamChatCompletion(ctx, body, controller.signal, render);
+    } catch (e) {
+        if (controller.signal.aborted) {
+            const err = new Error('stopped');
+            err.stoppedByUser = true;
+            throw err;
+        }
+        throw e;
+    } finally {
+        toastr.clear($toast);
+        // 流式期间 DOM 显示的是半成品，失败/停止时恢复原文；成功时调用方会再次刷新
+        if (started) {
+            try { ctx.updateMessageBlock(idx, msg); } catch { /* ignore */ }
+        }
+    }
+}
+
 async function runRewrite(instruction) {
     if (isRewriting || isCompressing) {
         toastr.warning('已有任务在进行中');
@@ -673,24 +859,36 @@ async function runRewrite(instruction) {
     ].join('\n\n');
 
     let result = '';
-    const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
+    // 整条重写 + 流式：不显示遮罩，让生成过程直接显示在原消息上
+    const streaming = !s.rewriteDiffMode && s.rewriteStream && ctx.mainApi === 'openai'
+        && typeof ctx.ChatCompletionService?.sendRequest === 'function'
+        && typeof ctx.stopGeneration === 'function';
+    const loaderHandle = (!streaming && ctx.loader) ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
     isRewriting = true;
     try {
-        // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
-        // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
-        // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
-        if (s.rewriteUseMainPreset) {
-            pendingTaskInjection = rewriteInstruction;
-            result = await ctx.generateQuietPrompt({ quietPrompt: '' });
-        } else {
+        result = await withPreset(s.rewritePreset, async () => {
+            if (streaming) {
+                return await runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction);
+            }
+            // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
+            // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
+            // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
+            if (s.rewriteUseMainPreset) {
+                pendingTaskInjection = rewriteInstruction;
+                return await ctx.generateQuietPrompt({ quietPrompt: '' });
+            }
             const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
                 role: m.is_user ? 'user' : 'assistant',
                 content: String(m.mes ?? ''),
             }));
             messages.push({ role: 'user', content: rewriteInstruction });
-            result = await ctx.generateRaw({ prompt: messages });
-        }
+            return await ctx.generateRaw({ prompt: messages });
+        });
     } catch (e) {
+        if (e?.stoppedByUser) {
+            toastr.info('已停止改写，原文未改动');
+            return false;
+        }
         console.error(LOG, '改写生成失败：', e);
         toastr.error('改写生成失败，详见控制台');
         return false;
@@ -940,6 +1138,13 @@ function buildSettingsHtml() {
           </div>
           <small class="notes">“立即压缩”默认压缩上次压缩点之后的全部消息；填了条数则只压缩最近 N 条。输入框旁的“选项”菜单（重新生成/AI帮答/续写）里也有同款按钮。</small>
 
+          <div class="flex-container" style="margin-top:8px; align-items:center; gap:6px;">
+            <span>保留最近</span>
+            <input id="cc_keep_last" type="number" min="0" step="1" class="text_pole" style="max-width:80px;" />
+            <span>条不压缩</span>
+          </div>
+          <small class="notes">倒数 N 条消息不参与压缩，原样保留在摘要之后，下次压缩时再纳入。0 表示不保留。手动、自动和指定条数压缩都生效。</small>
+
           <hr>
           <h4>压缩参数</h4>
 
@@ -948,6 +1153,10 @@ function buildSettingsHtml() {
             <span>使用主路径预设</span>
           </label>
           <small class="notes">开启后带上当前主对话的预设、世界书和上下文，仍只压缩选定范围；关闭时仅发送压缩提示词和待压缩消息。默认关闭。</small>
+
+          <label for="cc_compress_preset">压缩用预设</label>
+          <select id="cc_compress_preset" class="text_pole cc_preset_select"></select>
+          <small class="notes">压缩时临时切换到此 Chat Completion 预设，完成后切回。开启主路径时使用它的提示词和参数，关闭时只用它的采样参数；预设绑定连接时源/模型也随之切换。</small>
 
           <label for="cc_prompt">压缩提示词</label>
           <textarea id="cc_prompt" class="text_pole textarea_compact" rows="5"></textarea>
@@ -980,6 +1189,10 @@ function buildSettingsHtml() {
           </label>
           <small class="notes">开启后带上当前主对话的预设、世界书和上下文，并复用主对话缓存；关闭时仅发送未隐藏的聊天内容和改写指令，不添加主对话缓存断点。默认开启。</small>
 
+          <label for="cc_rw_preset">改写用预设</label>
+          <select id="cc_rw_preset" class="text_pole cc_preset_select"></select>
+          <small class="notes">改写时临时切换到此预设，完成后切回。选了与主对话不同的预设时，提示词前缀不同，无法复用主对话缓存。<br>注意：切换预设会重新载入预设文件，当前预设未保存的改动会丢失，请先保存。</small>
+
           <label class="checkbox_label" for="cc_rw_diff">
             <input id="cc_rw_diff" type="checkbox" />
             <span>局部替换模式（模型只输出改动片段，省 token、不动其余部分；关闭则整条重写）</span>
@@ -988,6 +1201,11 @@ function buildSettingsHtml() {
           <label class="checkbox_label" for="cc_rw_repair">
             <input id="cc_rw_repair" type="checkbox" />
             <span>解析失败时用独立工具调用修复（不影响缓存）</span>
+          </label>
+
+          <label class="checkbox_label" for="cc_rw_stream">
+            <input id="cc_rw_stream" type="checkbox" />
+            <span>整条重写时流式输出（边生成边显示在原消息上，点提示可停止）</span>
           </label>
 
           <label for="cc_rw_prompt">改写提示词</label>
@@ -1049,8 +1267,33 @@ function buildSettingsHtml() {
     </div>`;
 }
 
+let lastPresetNamesKey = null;
+function refreshPresetOptions() {
+    const s = getSettings();
+    let names = [];
+    try {
+        const pm = SillyTavern.getContext().getPresetManager?.('openai');
+        if (pm) names = pm.getAllPresets();
+    } catch { /* 预设管理器未就绪 */ }
+    const key = JSON.stringify([names, s.compressPreset, s.rewritePreset]);
+    if (key === lastPresetNamesKey) return;
+    lastPresetNamesKey = key;
+    const fill = (selector, selected) => {
+        const list = selected && !names.includes(selected) ? [...names, selected] : names;
+        const $sel = $(selector).empty().append($('<option>').val('').text('跟随当前预设'));
+        for (const name of list) {
+            const label = names.includes(name) ? name : `${name}（未找到）`;
+            $sel.append($('<option>').val(name).text(label));
+        }
+        $sel.val(selected || '');
+    };
+    fill('#cc_compress_preset', s.compressPreset);
+    fill('#cc_rw_preset', s.rewritePreset);
+}
+
 function refreshUI() {
     const s = getSettings();
+    refreshPresetOptions();
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_auto').prop('checked', s.autoMode);
     $('#cc_auto_every').val(s.autoEvery);
@@ -1059,9 +1302,11 @@ function refreshUI() {
     $('#cc_role').val(s.compressRole);
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
+    $('#cc_keep_last').val(s.compressKeepLast);
     $('#cc_rw_main_preset').prop('checked', s.rewriteUseMainPreset);
     $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
     $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
+    $('#cc_rw_stream').prop('checked', s.rewriteStream);
     $('#cc_rw_prompt').val(s.rewritePrompt);
     $('#cc_mode').val(s.cacheMode);
     $('#cc_bp1_en').prop('checked', s.bpCompression.enabled);
@@ -1083,13 +1328,19 @@ function bindUI() {
     $('#cc_auto').on('change', function () { s.autoMode = $(this).prop('checked'); save(); refreshCounterDisplay(); });
     $('#cc_auto_every').on('input', function () { s.autoEvery = Math.max(1, parseInt($(this).val()) || 10); save(); refreshCounterDisplay(); });
     $('#cc_compress_main_preset').on('change', function () { s.compressUseMainPreset = $(this).prop('checked'); save(); });
+    $('#cc_compress_preset').on('change', function () { s.compressPreset = String($(this).val() ?? ''); save(); });
+    $('#cc_rw_preset').on('change', function () { s.rewritePreset = String($(this).val() ?? ''); save(); });
+    // 展开下拉前刷新列表，跟上预设的新增/改名/删除
+    $('.cc_preset_select').on('mousedown focus', refreshPresetOptions);
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
+    $('#cc_keep_last').on('input', function () { s.compressKeepLast = Math.max(0, parseInt($(this).val()) || 0); save(); });
     $('#cc_rw_main_preset').on('change', function () { s.rewriteUseMainPreset = $(this).prop('checked'); save(); });
     $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
     $('#cc_rw_repair').on('change', function () { s.rewriteToolRepair = $(this).prop('checked'); save(); });
+    $('#cc_rw_stream').on('change', function () { s.rewriteStream = $(this).prop('checked'); save(); });
     $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
 
     $('#cc_mode').on('change', function () { s.cacheMode = String($(this).val()); save(); });
