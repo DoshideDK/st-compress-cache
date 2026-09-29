@@ -109,7 +109,8 @@ const DEFAULT_SETTINGS = Object.freeze({
         'preamble and no explanations.',
     compressRole: 'assistant',  // 摘要写回时的角色：assistant / user
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
-    compressKeepLast: 0,        // 倒数 N 条消息不参与压缩（摘要插在它们之前）
+    compressKeepLast: 0,        // 摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏
+    compressIncludeKept: true,  // 保留的 N 条是否也发送给模型并一起总结
     summaryPrefix: '【压缩记忆】\n',
 
     // —— 改写上一条 ——
@@ -127,6 +128,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     // —— 模式 ——
     autoMode: false,            // 自动模式开关（关闭即手动模式）
     autoEvery: 10,              // 用户每发送多少条消息自动压缩一次
+    autoTrigger: 'count',       // count：按用户输入条数；tokens：按历史 token 数
+    autoTokens: 20000,          // 上次摘要之后的可见消息 token 数达到此值时自动压缩
 
     // —— 缓存断点 ——
     cacheMode: 'magic',         // magic（gproxy 魔法字符串） / off
@@ -329,21 +332,46 @@ async function withPreset(presetName, fn) {
 // ============================================================
 //  压缩范围选择
 // ============================================================
-// countOverride 为数字时：取最近 N 条可压缩消息（旧行为）。
-// 否则：取“上一次压缩摘要之后”的全部可压缩消息；没有摘要则取全部。
-// keepLast > 0 时，最后 keepLast 条可压缩消息始终保留、不参与压缩。
+// 返回 { targets, kept }：
+//   targets —— 被压缩后隐藏、摘要插在它们之后的消息；
+//   kept    —— 最后 keepLast 条可压缩消息，始终保留可见（摘要插在它们之前）。
+// countOverride 为数字时：targets 取 kept 之前最近 N 条可压缩消息。
+// 否则：targets 取“上一次压缩摘要之后”到 kept 之前的全部可压缩消息。
+// 主路径压缩时告诉模型总结范围（聊天本身已在请求中）
+function buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride) {
+    const hasSummary = findLastSummaryIndex(chat) >= 0;
+    const partial = Number.isFinite(countOverride) && countOverride > 0;
+    let scope;
+    const excludeKept = !includeKept && kept.length > 0;
+    if (partial) {
+        scope = excludeKept
+            ? `Summarize ONLY the ${targets.length} message(s) that come right before the final ${kept.length} message(s) of the conversation above.`
+            : `Summarize ONLY the last ${targets.length + kept.length} message(s) of the conversation above.`;
+    } else if (hasSummary) {
+        scope = 'Summarize ONLY the part of the conversation above that comes after the most recent memory summary. Treat earlier summaries as background, do not repeat them.';
+    } else {
+        scope = 'Summarize the entire conversation above.';
+    }
+    if (excludeKept && !partial) {
+        scope += ` Do NOT include the final ${kept.length} message(s); they will be kept verbatim.`;
+    }
+    return scope + ' Output only the summary.';
+}
+
 function collectTargets(countOverride, keepLast = 0) {
     const chat = SillyTavern.getContext().chat;
-    if (!Array.isArray(chat) || chat.length === 0) return [];
+    if (!Array.isArray(chat) || chat.length === 0) return { targets: [], kept: [] };
 
     const eligible = (m) => m && m.is_system !== true && !isSummaryMessage(m);
 
     let skip = Math.max(0, Math.floor(Number(keepLast) || 0));
-    let end = chat.length; // 目标范围的开区间上界
+    let end = chat.length; // targets 范围的开区间上界
+    const kept = [];
     for (let i = chat.length - 1; i >= 0 && skip > 0; i--) {
-        if (eligible(chat[i])) { skip--; end = i; }
+        if (eligible(chat[i])) { skip--; end = i; kept.push(i); }
     }
-    if (skip > 0) return [];
+    kept.reverse();
+    if (skip > 0) return { targets: [], kept };
 
     if (Number.isFinite(countOverride) && countOverride > 0) {
         const targets = [];
@@ -351,18 +379,42 @@ function collectTargets(countOverride, keepLast = 0) {
             if (eligible(chat[i])) targets.push(i);
         }
         targets.reverse();
-        return targets;
+        return { targets, kept };
     }
 
-    let lastSummary = -1;
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (isSummaryMessage(chat[i])) { lastSummary = i; break; }
-    }
+    const lastSummary = findLastSummaryIndex(chat);
     const targets = [];
     for (let i = lastSummary + 1; i < end; i++) {
         if (eligible(chat[i])) targets.push(i);
     }
-    return targets;
+    return { targets, kept };
+}
+
+function findLastSummaryIndex(chat) {
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (isSummaryMessage(chat[i])) return i;
+    }
+    return -1;
+}
+
+// 历史 token：上一次摘要之后所有可见、非摘要消息的 token 数（含“保留最近 N 条”，它不影响触发）
+async function countHistoryTokens() {
+    const ctx = SillyTavern.getContext();
+    const chat = ctx.chat;
+    if (!Array.isArray(chat) || chat.length === 0) return 0;
+    const start = findLastSummaryIndex(chat) + 1;
+    const text = chat.slice(start)
+        .filter((m) => m && m.is_system !== true && !isSummaryMessage(m))
+        .map((m) => String(m.mes ?? ''))
+        .join('\n\n');
+    if (!text) return 0;
+    try {
+        if (typeof ctx.getTokenCountAsync === 'function') return await ctx.getTokenCountAsync(text);
+        if (typeof ctx.getTokenCount === 'function') return ctx.getTokenCount(text);
+    } catch (e) {
+        console.warn(LOG, 'token 计数失败，按字符估算：', e);
+    }
+    return Math.ceil(text.length / 3.5);
 }
 
 // ============================================================
@@ -378,7 +430,10 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const chat = ctx.chat;
 
     const keepLast = Math.max(0, Math.floor(Number(s.compressKeepLast) || 0));
-    const targets = collectTargets(countOverride, keepLast);
+    const { targets, kept } = collectTargets(countOverride, keepLast);
+    // 总结范围与插入位置解耦：保留的 N 条可见消息也可一起总结
+    const includeKept = s.compressIncludeKept && kept.length > 0;
+    const summarized = includeKept ? [...targets, ...kept] : targets;
     if (targets.length === 0) {
         if (!silent) {
             toastr.warning(keepLast > 0
@@ -388,7 +443,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
         return;
     }
 
-    const transcript = targets.map((i) => {
+    const transcript = summarized.map((i) => {
         const m = chat[i];
         const who = m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character');
         return `${who}: ${m.mes ?? ''}`;
@@ -400,12 +455,10 @@ async function runCompression(countOverride, { silent = false } = {}) {
     try {
         result = await withPreset(s.compressPreset, async () => {
             if (s.compressUseMainPreset) {
+                // 主路径：聊天原样随请求发送，不再单独提取文字稿；只在末尾追加一条 user 指令
                 pendingTaskInjection = [
                     s.compressPrompt,
-                    'Summarize ONLY the conversation excerpt below. Use the preceding context only as background. Output only the summary.',
-                    '--- CONVERSATION TO COMPRESS ---',
-                    transcript,
-                    '--- END CONVERSATION ---',
+                    buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride),
                 ].join('\n\n');
                 return await ctx.generateQuietPrompt({ quietPrompt: '' });
             }
@@ -504,7 +557,9 @@ async function runCompression(countOverride, { silent = false } = {}) {
     saveChatState();
     refreshCounterDisplay();
 
-    toastr.success(`已压缩 ${targets.length} 条消息`);
+    toastr.success(includeKept
+        ? `已压缩 ${summarized.length} 条消息（其中最近 ${kept.length} 条保留可见）`
+        : `已压缩 ${targets.length} 条消息`);
 }
 
 // ============================================================
@@ -1030,6 +1085,21 @@ function onGenerationEnded() {
     try {
         const s = getSettings();
         if (!s.enabled || !s.autoMode || isCompressing || isRewriting) return;
+        if (s.autoTrigger === 'tokens') {
+            // 回复已落库后再计数
+            setTimeout(async () => {
+                try {
+                    if (isCompressing || isRewriting) return;
+                    const tokens = await countHistoryTokens();
+                    refreshCounterDisplay(tokens);
+                    const limit = Math.max(1, Number(s.autoTokens) || 20000);
+                    if (tokens >= limit) await runCompression(undefined, { silent: true });
+                } catch (e) {
+                    console.warn(LOG, '按 token 自动压缩出错：', e);
+                }
+            }, 500);
+            return;
+        }
         const st = getChatState();
         const every = Math.max(1, Number(s.autoEvery) || 10);
         if ((st.userMsgCount || 0) >= every) {
@@ -1041,9 +1111,22 @@ function onGenerationEnded() {
     }
 }
 
-function refreshCounterDisplay() {
+function refreshCounterDisplay(knownTokens) {
     try {
         const s = getSettings();
+        $('#cc_trigger_count').toggle(s.autoTrigger !== 'tokens');
+        $('#cc_trigger_tokens').toggle(s.autoTrigger === 'tokens');
+        if (s.autoTrigger === 'tokens') {
+            const limit = Math.max(1, Number(s.autoTokens) || 20000);
+            if (Number.isFinite(knownTokens)) {
+                $('#cc_token_counter').text(`${knownTokens} / ${limit}`);
+            } else {
+                countHistoryTokens()
+                    .then((t) => $('#cc_token_counter').text(`${t} / ${limit}`))
+                    .catch(() => { /* ignore */ });
+            }
+            return;
+        }
         const st = getChatState();
         const every = Math.max(1, Number(s.autoEvery) || 10);
         $('#cc_counter').text(`${st.userMsgCount || 0} / ${every}`);
@@ -1122,12 +1205,24 @@ function buildSettingsHtml() {
 
           <label class="checkbox_label" for="cc_auto">
             <input id="cc_auto" type="checkbox" />
-            <span>自动模式：用户每发送若干条消息后自动压缩</span>
+            <span>自动模式：达到触发条件后自动压缩</span>
           </label>
           <div class="flex-container" style="align-items:center; gap:6px;">
+            <span>触发方式</span>
+            <select id="cc_auto_trigger" class="text_pole" style="max-width:200px;">
+              <option value="count">按用户输入条数</option>
+              <option value="tokens">按历史 token 数</option>
+            </select>
+          </div>
+          <div id="cc_trigger_count" class="flex-container" style="align-items:center; gap:6px;">
             <span>每</span>
             <input id="cc_auto_every" type="number" min="1" step="1" class="text_pole" style="max-width:80px;" />
             <span>条用户输入压缩一次（当前计数：<span id="cc_counter">0 / 10</span>）</span>
+          </div>
+          <div id="cc_trigger_tokens" class="flex-container" style="align-items:center; gap:6px;">
+            <span>上次压缩后的历史达到</span>
+            <input id="cc_auto_tokens" type="number" min="1" step="1000" class="text_pole" style="max-width:110px;" />
+            <span>token 时压缩（当前：<span id="cc_token_counter">0 / 20000</span>）</span>
           </div>
           <small class="notes">关闭自动模式即为手动模式。两种模式下都压缩“上一次压缩点之后”的消息；自动模式开启时也随时可以手动压缩。编辑重发不计入条数。</small>
 
@@ -1143,7 +1238,11 @@ function buildSettingsHtml() {
             <input id="cc_keep_last" type="number" min="0" step="1" class="text_pole" style="max-width:80px;" />
             <span>条不压缩</span>
           </div>
-          <small class="notes">倒数 N 条消息不参与压缩，原样保留在摘要之后，下次压缩时再纳入。0 表示不保留。手动、自动和指定条数压缩都生效。</small>
+          <label class="checkbox_label" for="cc_include_kept">
+            <input id="cc_include_kept" type="checkbox" />
+            <span>保留的消息也发送并一起总结</span>
+          </label>
+          <small class="notes">摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏。勾选时这 N 条也会发给模型并写进摘要，只影响插入位置；不勾选时它们不参与本次总结。0 表示不保留。这个设置不影响自动触发。</small>
 
           <hr>
           <h4>压缩参数</h4>
@@ -1303,6 +1402,9 @@ function refreshUI() {
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
     $('#cc_keep_last').val(s.compressKeepLast);
+    $('#cc_include_kept').prop('checked', s.compressIncludeKept);
+    $('#cc_auto_trigger').val(s.autoTrigger);
+    $('#cc_auto_tokens').val(s.autoTokens);
     $('#cc_rw_main_preset').prop('checked', s.rewriteUseMainPreset);
     $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
     $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
@@ -1336,6 +1438,9 @@ function bindUI() {
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
+    $('#cc_include_kept').on('change', function () { s.compressIncludeKept = $(this).prop('checked'); save(); });
+    $('#cc_auto_trigger').on('change', function () { s.autoTrigger = String($(this).val()); save(); refreshCounterDisplay(); });
+    $('#cc_auto_tokens').on('input', function () { s.autoTokens = Math.max(1, parseInt($(this).val()) || 20000); save(); refreshCounterDisplay(); });
     $('#cc_keep_last').on('input', function () { s.compressKeepLast = Math.max(0, parseInt($(this).val()) || 0); save(); });
     $('#cc_rw_main_preset').on('change', function () { s.rewriteUseMainPreset = $(this).prop('checked'); save(); });
     $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
@@ -1423,7 +1528,7 @@ jQuery(async () => {
         const { eventSource, event_types } = ctx;
         eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
         eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
-        eventSource.on(event_types.CHAT_CHANGED, refreshCounterDisplay);
+        eventSource.on(event_types.CHAT_CHANGED, () => refreshCounterDisplay());
 
         console.log(LOG, '已加载');
     } catch (e) {
