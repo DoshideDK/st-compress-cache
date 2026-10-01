@@ -140,6 +140,12 @@ const DEFAULT_SETTINGS = Object.freeze({
     bpCompression:   { enabled: false, ttl: '1h' },
     bpLastAssistant: { enabled: true,  ttl: '5m' },
     bpInput:         { enabled: true,  ttl: '5m' },
+
+    // —— 自定义连接（压缩 / 改写各自独立配置）——
+    // 注意：这里的“预设”指 ST 的代理预设（proxies 里带 url / 账号密码的那条），
+    // 不是破限或提示词预设。source 为空表示跟随当前连接。
+    connCompress: { enabled: false, source: '', proxyPreset: '', proxyUrl: '', proxyPassword: '', model: '' },
+    connRewrite:  { enabled: false, source: '', proxyPreset: '', proxyUrl: '', proxyPassword: '', model: '' },
 });
 
 // —— 设置读取/初始化 ——
@@ -157,6 +163,12 @@ function getSettings() {
         if (typeof s[bp] !== 'object' || s[bp] === null) s[bp] = structuredClone(DEFAULT_SETTINGS[bp]);
         if (!Object.hasOwn(s[bp], 'enabled')) s[bp].enabled = DEFAULT_SETTINGS[bp].enabled;
         if (!Object.hasOwn(s[bp], 'ttl')) s[bp].ttl = DEFAULT_SETTINGS[bp].ttl;
+    }
+    for (const conn of ['connCompress', 'connRewrite']) {
+        if (typeof s[conn] !== 'object' || s[conn] === null) s[conn] = structuredClone(DEFAULT_SETTINGS[conn]);
+        for (const k of Object.keys(DEFAULT_SETTINGS[conn])) {
+            if (!Object.hasOwn(s[conn], k)) s[conn][k] = DEFAULT_SETTINGS[conn][k];
+        }
     }
     return s;
 }
@@ -452,6 +464,8 @@ async function runCompression(countOverride, { silent = false } = {}) {
     let result = '';
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在压缩上下文…' }) : null;
     isCompressing = true;
+    const conn = resolveConnection(s, 'connCompress');
+    if (conn) warnConnection(conn, '压缩');
     try {
         result = await withPreset(s.compressPreset, async () => {
             if (s.compressUseMainPreset) {
@@ -460,12 +474,19 @@ async function runCompression(countOverride, { silent = false } = {}) {
                     s.compressPrompt,
                     buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride),
                 ].join('\n\n');
-                return await ctx.generateQuietPrompt({ quietPrompt: '' });
+                return await runMainPathTask(ctx, { conn, tag: '压缩' });
             }
-            return await ctx.generateRaw({
+            // 直连路径：只发压缩提示词 + 待压缩消息。
+            // 走 processRequest 而不是 generateRaw，才能在吃预设参数的同时覆盖连接
+            // （generateRaw 不支持指定预设，且连接只能取全局设置）。
+            return await runDirectTask(ctx, {
+                conn,
+                presetName: s.compressPreset,
                 systemPrompt: s.compressPrompt,
-                prompt: transcript,
-            });
+                userPrompt: transcript,
+                // 摘要可能很长，优先用当前连接/预设的输出上限，取不到再退回 2048
+                maxTokens: Number(ctx.chatCompletionSettings?.openai_max_tokens) || 2048,
+            }, '压缩');
         });
     } catch (e) {
         console.error(LOG, '压缩生成失败：', e);
@@ -636,7 +657,8 @@ function extractToolEdits(data) {
     return null;
 }
 
-function getRewriteRepairModel(settings, source) {
+// 当前连接在指定源下使用的模型（未指定自定义连接时的默认模型）
+function currentModelForSource(settings, source) {
     const modelFields = {
         claude: 'claude_model',
         openai: 'openai_model',
@@ -684,20 +706,197 @@ function buildRewriteRepairPrompt(original, instruction, draft) {
 }
 
 // 独立请求所需的连接参数（源、模型、自定义地址、反代），与主对话当前连接一致
-function buildConnectionPayload(settings) {
-    const source = settings.chat_completion_source;
-    const model = getRewriteRepairModel(settings, source);
-    const payload = { chat_completion_source: source };
-    if (model) payload.model = model;
-    if (String(source ?? '').toLowerCase() === 'custom' && settings.custom_url) {
-        payload.custom_url = settings.custom_url;
-    }
-    if (settings.reverse_proxy) payload.reverse_proxy = settings.reverse_proxy;
-    if (settings.proxy_password) payload.proxy_password = settings.proxy_password;
-    return payload;
+// 各源把自定义地址存在不同字段里；换源或走直连时需要按源填对字段。
+const API_URL_FIELD_BY_SOURCE = Object.freeze({
+    custom: 'custom_url',
+    vertexai: 'vertexai_region',
+    zai: 'zai_endpoint',
+    siliconflow: 'siliconflow_endpoint',
+    minimax: 'minimax_endpoint',
+    pollinations: 'pollinations_endpoint',
+});
+
+// 按源从当前 Chat Completion 设置里取出自定义地址字段
+function apiUrlFieldsForSource(settings, source) {
+    const field = API_URL_FIELD_BY_SOURCE[String(source ?? '').toLowerCase()];
+    const value = field ? settings?.[field] : '';
+    return field && value ? { [field]: value } : {};
 }
 
-async function requestRewriteToolRepair(ctx, original, instruction, draft) {
+// ============================================================
+//  自定义连接（源 / 代理预设 / 模型）
+// ============================================================
+// 说明：这里说的“预设”是 ST 的**代理预设**——即 Connection Profiles 里那条
+// 带 url / 账号密码、用于连接中转（如 gproxy）的记录，不是破限或提示词预设。
+// 用户既可以从 ST 现有代理预设里挑，也可以手填 url / 密码覆盖。
+
+// 换源时要清掉的、只对特定源有意义的字段；残留这些字段会让后端报 400。
+const SOURCE_SPECIFIC_FIELDS = Object.freeze([
+    'custom_url',
+    'vertexai_region',
+    'zai_endpoint',
+    'siliconflow_endpoint',
+    'minimax_endpoint',
+    'pollinations_endpoint',
+    'azure_base_url',
+    'azure_deployment_name',
+    'azure_api_version',
+    'secret_id',
+]);
+
+function findProxyPreset(name) {
+    if (!name) return null;
+    try {
+        const list = SillyTavern.getContext().proxies;
+        if (!Array.isArray(list)) return null;
+        return list.find(p => p && p.name === name) || null;
+    } catch {
+        return null;
+    }
+}
+
+// 把一条自定义连接配置解析成实际要用的连接参数；未启用时返回 null（表示走原逻辑）
+function resolveConnection(s, key) {
+    const c = s?.[key];
+    if (!c || !c.enabled) return null;
+
+    const ctxSettings = SillyTavern.getContext().chatCompletionSettings || {};
+    const preset = findProxyPreset(c.proxyPreset);
+
+    // 优先级：手填 > 代理预设 > 当前连接。手填便于覆盖代理预设里的旧 url/密码。
+    const reverseProxy = String(c.proxyUrl || preset?.url || '').trim();
+    const proxyPassword = String(c.proxyPassword || preset?.password || '');
+
+    const warnings = [];
+    if (!String(c.source || '').trim()) warnings.push('未选择源，将沿用当前连接的源');
+
+    return {
+        key,
+        source: String(c.source || '').trim() || String(ctxSettings.chat_completion_source || '').trim(),
+        model: String(c.model || '').trim(),
+        reverseProxy,
+        proxyPassword,
+        missingProxyPreset: !!c.proxyPreset && !preset,
+        warnings,
+    };
+}
+
+// 把连接参数覆盖到一个已构造好的请求体上（主路径捕获的请求体或直连构造的请求体）。
+// 返回被清空的字段列表，便于日志排查。
+function applyConnectionOverrides(body, conn) {
+    if (!body || !conn) return;
+    const cleared = [];
+    for (const f of SOURCE_SPECIFIC_FIELDS) {
+        if (body[f] !== undefined) { delete body[f]; cleared.push(f); }
+    }
+    if (conn.source) body.chat_completion_source = conn.source;
+    if (conn.model) body.model = conn.model;
+    body.reverse_proxy = conn.reverseProxy || undefined;
+    body.proxy_password = conn.proxyPassword || undefined;
+    if (!conn.reverseProxy) delete body.reverse_proxy;
+    if (!conn.proxyPassword) delete body.proxy_password;
+    return cleared;
+}
+
+// 直连路径构造连接相关字段（其余采样参数交给预设或当前设置）
+function connectionFields(conn) {
+    const fields = {};
+    if (conn?.source) fields.chat_completion_source = conn.source;
+    if (conn?.model) fields.model = conn.model;
+    if (conn?.reverseProxy) fields.reverse_proxy = conn.reverseProxy;
+    if (conn?.proxyPassword) fields.proxy_password = conn.proxyPassword;
+    return fields;
+}
+
+function warnConnection(conn, tag) {
+    if (!conn) return;
+    if (conn.missingProxyPreset) {
+        console.warn(LOG, `${tag}：找不到代理预设「${conn.proxyPreset}」，已按其余设置继续`);
+    }
+    for (const w of conn.warnings) console.warn(LOG, `${tag}：${w}`);
+}
+
+function getChatCompletionService(ctx) {
+    const service = ctx.ChatCompletionService;
+    return service && typeof service.processRequest === 'function' ? service : null;
+}
+
+// —— 非流式任务请求 ——
+// 直连路径：自己拼消息 + 按源填自定义地址，预设参数通过 options.presetName 应用，
+// 不切换全局选中预设。返回纯文本；失败返回 null。
+async function runDirectTask(ctx, { conn, presetName, systemPrompt, userPrompt, messages: presetMessages, maxTokens }, tag) {
+    const service = getChatCompletionService(ctx);
+    if (!service) throw new Error('当前 SillyTavern 版本未提供 ChatCompletionService');
+
+    const settings = ctx.chatCompletionSettings || {};
+    const messages = [];
+    if (Array.isArray(presetMessages)) {
+        messages.push(...presetMessages);
+    } else {
+        if (systemPrompt) messages.push({ role: 'system', content: String(systemPrompt) });
+        messages.push({ role: 'user', content: String(userPrompt) });
+    }
+
+    const payload = {
+        stream: false,
+        messages,
+        ...connectionFields(conn),
+        ...apiUrlFieldsForSource(settings, conn?.source),
+        max_tokens: Number(maxTokens) || Number(settings.openai_max_tokens) || undefined,
+    };
+    // 预设里通常不含 model 字段（模型按源存在 claude_model 等字段里），
+    // 所以只要没指定自定义模型，就补上该源当前的模型，避免请求没有模型。
+    if (!conn?.model) {
+        const source = conn?.source || settings.chat_completion_source;
+        const model = currentModelForSource(settings, source);
+        if (model) payload.model = model;
+    }
+
+    const data = await service.processRequest(payload, { presetName: presetName || undefined }, true);
+    const content = data?.content;
+    return content === undefined || content === null ? '' : String(content);
+}
+
+// —— 自定义连接：临时切换全局 Chat Completion 设置 ——
+// 主路径压缩必须让 ST 自己构建请求体（拦截器注入 + 预设提示词），因此只能临时改全局设置。
+// 只覆盖源 / 代理 url / 代理密码 / 模型，绝不碰预设选择等其它设置；finally 里逐个还原。
+const CONN_SETTING_KEYS = Object.freeze(['chat_completion_source', 'reverse_proxy', 'proxy_password', 'model']);
+
+async function withConnection(ctx, conn, fn) {
+    if (!conn || ctx.mainApi !== 'openai') return await fn();
+    const settings = ctx.chatCompletionSettings;
+    if (!settings) return await fn();
+
+    const saved = {};
+    for (const k of CONN_SETTING_KEYS) saved[k] = settings[k];
+
+    try {
+        if (conn.source) settings.chat_completion_source = conn.source;
+        settings.reverse_proxy = conn.reverseProxy || '';
+        settings.proxy_password = conn.proxyPassword || '';
+        if (conn.model) settings.model = conn.model;
+        return await fn();
+    } finally {
+        for (const k of CONN_SETTING_KEYS) settings[k] = saved[k];
+    }
+}
+
+// —— 主路径任务请求（非流式）——
+// 有自定义连接时：临时切全局连接 → ST 用完整管线构建并直接发出请求 → 还原。
+// 没有自定义连接时：行为与改动前完全一致。
+async function runMainPathTask(ctx, { conn, tag }) {
+    if (!conn) return await ctx.generateQuietPrompt({ quietPrompt: '' });
+    return await withConnection(ctx, conn, async () => {
+        console.debug(LOG, `${tag}：主路径临时切换到自定义连接`, {
+            source: conn.source,
+            model: conn.model,
+            proxy: conn.reverseProxy ? '已设置' : '未设置',
+        });
+        return await ctx.generateQuietPrompt({ quietPrompt: '' });
+    });
+}
+
+async function requestRewriteToolRepair(ctx, original, instruction, draft, conn, presetName) {
     const service = ctx.ChatCompletionService;
     if (!service || typeof service.processRequest !== 'function') {
         console.warn(LOG, '当前 SillyTavern 版本未提供 ChatCompletionService，跳过结构化改写修复');
@@ -705,7 +904,6 @@ async function requestRewriteToolRepair(ctx, original, instruction, draft) {
     }
 
     const payload = {
-        ...buildConnectionPayload(ctx.chatCompletionSettings || {}),
         stream: false,
         messages: [{
             role: 'user',
@@ -713,12 +911,14 @@ async function requestRewriteToolRepair(ctx, original, instruction, draft) {
         }],
         max_tokens: 2048,
         json_schema: structuredClone(REWRITE_REPAIR_SCHEMA),
+        ...connectionFields(conn),
     };
 
     try {
         // 独立自定义请求不经过 generate 拦截器管线，因此不会带魔法字符串缓存标记，
         // 也不会改变主对话的严格缓存前缀；请求本身只含上面的三段修复材料。
-        let data = await service.processRequest(payload, {}, false);
+        // 预设通过 options.presetName 应用，不切换全局选中预设。
+        let data = await service.processRequest(payload, { presetName }, false);
         if (data && typeof data.json === 'function') data = await data.json();
         const edits = extractToolEdits(data);
         if (edits === null) console.warn(LOG, '结构化修复响应中未解析出 edits：', data);
@@ -796,6 +996,9 @@ async function captureMainPathRequest(ctx) {
         if (!body) throw e; // 捕获后的中止错误是预期内的
     } finally {
         eventSource.removeListener(eventName, listener);
+        // quiet 生成本不会锁 UI（ST 的 is_send_press 只在非 quiet 时置位），
+        // 但 stopGeneration 会触发 GENERATION_STOPPED，为稳妥起见显式兜底解锁一次。
+        try { if (typeof ctx.unblockGeneration === 'function') ctx.unblockGeneration('quiet'); } catch { /* ignore */ }
     }
     return { body, fallback };
 }
@@ -830,7 +1033,7 @@ function createStreamRenderer(ctx, idx, msg) {
     };
 }
 
-async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction) {
+async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction, conn) {
     const msg = chat[idx];
     const controller = new AbortController();
     const render = createStreamRenderer(ctx, idx, msg);
@@ -849,6 +1052,8 @@ async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction) {
             pendingTaskInjection = null;
             if (!captured.body) return String(captured.fallback ?? '');
             body = captured.body;
+            // 自定义连接只覆盖请求体里的连接字段，其余（预设参数、世界书、缓存断点）原样保留
+            applyConnectionOverrides(body, conn);
         } else {
             const settings = ctx.chatCompletionSettings || {};
             const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
@@ -857,7 +1062,8 @@ async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction) {
             }));
             messages.push({ role: 'user', content: rewriteInstruction });
             body = {
-                ...buildConnectionPayload(settings),
+                ...connectionFields(conn),
+                ...apiUrlFieldsForSource(settings, conn?.source),
                 messages,
                 max_tokens: settings.openai_max_tokens,
                 temperature: Number(settings.temp_openai),
@@ -914,6 +1120,8 @@ async function runRewrite(instruction) {
     ].join('\n\n');
 
     let result = '';
+    const conn = resolveConnection(s, 'connRewrite');
+    if (conn) warnConnection(conn, '改写');
     // 整条重写 + 流式：不显示遮罩，让生成过程直接显示在原消息上
     const streaming = !s.rewriteDiffMode && s.rewriteStream && ctx.mainApi === 'openai'
         && typeof ctx.ChatCompletionService?.sendRequest === 'function'
@@ -923,21 +1131,27 @@ async function runRewrite(instruction) {
     try {
         result = await withPreset(s.rewritePreset, async () => {
             if (streaming) {
-                return await runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction);
+                return await runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction, conn);
             }
             // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
             // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
             // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
             if (s.rewriteUseMainPreset) {
                 pendingTaskInjection = rewriteInstruction;
-                return await ctx.generateQuietPrompt({ quietPrompt: '' });
+                return await runMainPathTask(ctx, { conn, tag: '改写' });
             }
+            // 直连路径：未隐藏的聊天内容 + 改写指令
             const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
                 role: m.is_user ? 'user' : 'assistant',
                 content: String(m.mes ?? ''),
             }));
             messages.push({ role: 'user', content: rewriteInstruction });
-            return await ctx.generateRaw({ prompt: messages });
+            return await runDirectTask(ctx, {
+                conn,
+                presetName: s.rewritePreset,
+                userPrompt: '',
+                messages,
+            }, '改写');
         });
     } catch (e) {
         if (e?.stoppedByUser) {
@@ -975,7 +1189,7 @@ async function runRewrite(instruction) {
             const repairLoader = ctx.loader ? ctx.loader.show({ message: '正在结构化修复改写结果…' }) : null;
             isRewriting = true;
             try {
-                const edits = await requestRewriteToolRepair(ctx, original, instruction, result);
+                const edits = await requestRewriteToolRepair(ctx, original, instruction, result, conn, s.rewritePreset);
                 if (edits !== null) {
                     const repairPass = applyEditBlocks(original, edits);
                     // 修复结果反而全部失配时，保留第一段的部分成果
@@ -1185,6 +1399,80 @@ function ttlOptions(val) {
     return opt('default', 'default（渠道默认）') + opt('5m', '5m') + opt('1h', '1h');
 }
 
+// ST 的 Chat Completion 源列表（与 openai.js 的 chat_completion_sources 对应）
+const CC_SOURCES = Object.freeze([
+    ['', '跟随当前连接'],
+    ['claude', 'Claude'],
+    ['openai', 'OpenAI'],
+    ['openrouter', 'OpenRouter'],
+    ['makersuite', 'Google AI Studio'],
+    ['vertexai', 'Vertex AI'],
+    ['mistralai', 'MistralAI'],
+    ['custom', 'Custom (OpenAI 兼容)'],
+    ['cohere', 'Cohere'],
+    ['perplexity', 'Perplexity'],
+    ['groq', 'Groq'],
+    ['electronhub', 'ElectronHub'],
+    ['chutes', 'Chutes'],
+    ['nanogpt', 'NanoGPT'],
+    ['deepseek', 'DeepSeek'],
+    ['aimlapi', 'AIMLAPI'],
+    ['xai', 'xAI'],
+    ['pollinations', 'Pollinations'],
+    ['moonshot', 'Moonshot'],
+    ['fireworks', 'Fireworks'],
+    ['cometapi', 'CometAPI'],
+    ['azure_openai', 'Azure OpenAI'],
+    ['zai', 'Z.AI'],
+    ['siliconflow', 'SiliconFlow'],
+    ['workers_ai', 'Cloudflare Workers AI'],
+    ['minimax', 'MiniMax'],
+]);
+
+// 生成一块「自定义连接」设置区。taskId 用于区分压缩 / 改写的 DOM id 与设置键。
+function buildConnectionHtml(taskId, title, note) {
+    const id = `cc_conn_${taskId}`;
+    const options = CC_SOURCES
+        .map(([v, label]) => `<option value="${v}">${label}</option>`)
+        .join('');
+    return `
+          <hr>
+          <h4>${title}</h4>
+
+          <label class="checkbox_label" for="${id}_enabled">
+            <input id="${id}_enabled" type="checkbox" />
+            <span>启用自定义连接（源 / 代理预设 / 模型）</span>
+          </label>
+          <small class="notes">${note}这里的「代理预设」是 ST 里带 url 和账号密码的那条代理记录（Connection Profiles 用的那个），<b>不是</b>破限或提示词预设。</small>
+
+          <div class="${id}_body" style="display:none;">
+            <label for="${id}_source">源</label>
+            <select id="${id}_source" class="text_pole">${options}</select>
+
+            <label for="${id}_proxy">代理预设</label>
+            <select id="${id}_proxy" class="text_pole"></select>
+            <small class="notes">选择 ST 已有的代理预设（自动带出 url 和密码）。下面的手填项会覆盖它。</small>
+
+            <div class="flex-container">
+              <div class="flex1">
+                <label for="${id}_proxy_url">代理地址（手填，可选）</label>
+                <input id="${id}_proxy_url" type="text" class="text_pole" placeholder="留空则用代理预设的 url" />
+              </div>
+              <div class="flex1">
+                <label for="${id}_proxy_pw">代理密码（手填，可选）</label>
+                <input id="${id}_proxy_pw" type="password" class="text_pole" placeholder="留空则用代理预设的密码" />
+              </div>
+            </div>
+
+            <label for="${id}_model">模型</label>
+            <input id="${id}_model" type="text" class="text_pole" list="${id}_models"
+                   placeholder="留空则用该源的当前模型" />
+            <datalist id="${id}_models"></datalist>
+            <small class="notes">可直接手填模型 id；下拉候选来自当前连接的模型列表。</small>
+          </div>
+`;
+}
+
 function buildSettingsHtml() {
     return `
     <div class="compress-cache-settings">
@@ -1256,6 +1544,8 @@ function buildSettingsHtml() {
           <label for="cc_compress_preset">压缩用预设</label>
           <select id="cc_compress_preset" class="text_pole cc_preset_select"></select>
           <small class="notes">压缩时临时切换到此 Chat Completion 预设，完成后切回。开启主路径时使用它的提示词和参数，关闭时只用它的采样参数；预设绑定连接时源/模型也随之切换。</small>
+${buildConnectionHtml('compress', '压缩连接（源 / 代理预设 / 模型）',
+        '开启后压缩请求会走这里指定的源、代理和模型，与主对话当前连接无关；两种压缩模式都生效。')}
 
           <label for="cc_prompt">压缩提示词</label>
           <textarea id="cc_prompt" class="text_pole textarea_compact" rows="5"></textarea>
@@ -1291,6 +1581,8 @@ function buildSettingsHtml() {
           <label for="cc_rw_preset">改写用预设</label>
           <select id="cc_rw_preset" class="text_pole cc_preset_select"></select>
           <small class="notes">改写时临时切换到此预设，完成后切回。选了与主对话不同的预设时，提示词前缀不同，无法复用主对话缓存。<br>注意：切换预设会重新载入预设文件，当前预设未保存的改动会丢失，请先保存。</small>
+${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）',
+        '开启后改写请求会走这里指定的源、代理和模型；结构修复请求也一并跟随。开了「使用主路径预设」时提示词仍由主路径构建，只替换连接。')}
 
           <label class="checkbox_label" for="cc_rw_diff">
             <input id="cc_rw_diff" type="checkbox" />
@@ -1374,7 +1666,11 @@ function refreshPresetOptions() {
         const pm = SillyTavern.getContext().getPresetManager?.('openai');
         if (pm) names = pm.getAllPresets();
     } catch { /* 预设管理器未就绪 */ }
-    const key = JSON.stringify([names, s.compressPreset, s.rewritePreset]);
+    const key = JSON.stringify([
+        names, s.compressPreset, s.rewritePreset,
+        s.connCompress, s.connRewrite,
+        SillyTavern.getContext().proxies,
+    ]);
     if (key === lastPresetNamesKey) return;
     lastPresetNamesKey = key;
     const fill = (selector, selected) => {
@@ -1388,11 +1684,61 @@ function refreshPresetOptions() {
     };
     fill('#cc_compress_preset', s.compressPreset);
     fill('#cc_rw_preset', s.rewritePreset);
+    refreshConnectionUI(s);
+}
+
+const CC_CONN_TASKS = Object.freeze([
+    ['compress', 'connCompress'],
+    ['rewrite', 'connRewrite'],
+]);
+
+// 刷新「自定义连接」区域的三个下拉与显隐
+function refreshConnectionUI(s) {
+    const ctx = SillyTavern.getContext();
+    const proxies = Array.isArray(ctx.proxies) ? ctx.proxies : [];
+    const settings = ctx.chatCompletionSettings || {};
+
+    for (const [taskId, key] of CC_CONN_TASKS) {
+        const c = s[key];
+        const id = `cc_conn_${taskId}`;
+
+        const $proxy = $(`#${id}_proxy`).empty();
+        $proxy.append($('<option>').val('').text('不使用代理预设'));
+        for (const p of proxies) {
+            if (!p || !p.name) continue;
+            $proxy.append($('<option>').val(p.name).text(p.name));
+        }
+        $proxy.val(c.proxyPreset || '');
+
+        const $dl = $(`#${id}_models`).empty();
+        const current = currentModelForSource(settings, c.source || settings.chat_completion_source);
+        if (current) $dl.append($('<option>').val(current));
+        try {
+            const list = ctx.models;
+            if (Array.isArray(list)) {
+                for (const m of list) {
+                    const value = typeof m === 'string' ? m : (m && (m.id || m.name));
+                    if (value) $dl.append($('<option>').val(value));
+                }
+            }
+        } catch { /* 模型列表不可用则只留当前模型 */ }
+
+        $(`.${id}_body`).toggle(!!c.enabled);
+    }
 }
 
 function refreshUI() {
     const s = getSettings();
     refreshPresetOptions();
+    for (const [taskId, key] of CC_CONN_TASKS) {
+        const c = s[key];
+        const id = `cc_conn_${taskId}`;
+        $(`#${id}_enabled`).prop('checked', !!c.enabled);
+        $(`#${id}_source`).val(c.source || '');
+        $(`#${id}_proxy_url`).val(c.proxyUrl || '');
+        $(`#${id}_proxy_pw`).val(c.proxyPassword || '');
+        $(`#${id}_model`).val(c.model || '');
+    }
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_auto').prop('checked', s.autoMode);
     $('#cc_auto_every').val(s.autoEvery);
@@ -1433,7 +1779,23 @@ function bindUI() {
     $('#cc_compress_preset').on('change', function () { s.compressPreset = String($(this).val() ?? ''); save(); });
     $('#cc_rw_preset').on('change', function () { s.rewritePreset = String($(this).val() ?? ''); save(); });
     // 展开下拉前刷新列表，跟上预设的新增/改名/删除
+    // （同时会刷新代理预设下拉与模型候选）
     $('.cc_preset_select').on('mousedown focus', refreshPresetOptions);
+
+    for (const [taskId, key] of CC_CONN_TASKS) {
+        const c = () => s[key];
+        const id = `cc_conn_${taskId}`;
+        $(`#${id}_enabled`).on('change', function () {
+            c().enabled = $(this).prop('checked');
+            save();
+            refreshConnectionUI(s);
+        });
+        $(`#${id}_source`).on('change', function () { c().source = String($(this).val() ?? ''); save(); });
+        $(`#${id}_proxy`).on('change', function () { c().proxyPreset = String($(this).val() ?? ''); save(); });
+        $(`#${id}_proxy_url`).on('input', function () { c().proxyUrl = String($(this).val() ?? ''); save(); });
+        $(`#${id}_proxy_pw`).on('input', function () { c().proxyPassword = String($(this).val() ?? ''); save(); });
+        $(`#${id}_model`).on('input', function () { c().model = String($(this).val() ?? ''); save(); });
+    }
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
