@@ -22,18 +22,3 @@
     width: 100%;
     resize: vertical;
 }
-
-.compress-cache-settings .cc_bp_table th {
-    font-weight: bold;
-    opacity: 0.8;
-    padding-bottom: 4px;
-}
-
-.compress-cache-settings .cc_bp_table td {
-    padding: 2px 4px;
-    vertical-align: middle;
-}
-
-.compress-cache-settings .cc_bp_table input[type="text"] {
-    width: 100%;
-}

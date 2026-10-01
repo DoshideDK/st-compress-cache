@@ -1,5 +1,5 @@
 /*
- * 压缩与缓存断点 (Compress & Cache Breakpoints)
+ * 压缩与改写 (Compress & Rewrite)
  * SillyTavern 第三方 UI 扩展
  *
  * 功能：
@@ -11,28 +11,19 @@
  *     可设置“保留最近 N 条不压缩”，摘要插在这些消息之前。
  *  2) 改写上一条：在输入框写下改写要求，点“选项”菜单里的「改写上一条」或
  *     /rewrite 命令，对最后一条 AI 回复做局部改写（搜索替换块）或整条重写。
- *     指令不进存档；原文保存为 swipe；请求命中已有缓存前缀（只在最后一条
- *     user 消息打断点，与上一轮位置一致，纯命中、零新写入）。整条重写可流式输出。
+ *     指令不进存档；原文保存为 swipe。整条重写可流式输出。
  *     压缩和改写都可指定一个 Chat Completion 预设，执行期间临时切换、结束后切回。
- *  3) 三组缓存断点（TTL 可配）：
- *       - 上次压缩结果所在的消息（默认关闭）
- *       - 倒数第一条 assistant 消息
- *       - 输入消息（最后一条 user 消息）
- *     断点通过 gproxy 的“魔法字符串”注入：gproxy 会在发送前删除触发串、
- *     并在该位置写入原生缓存标记。注入只作用于本次请求、不写回存档。
- *
- * gproxy 用法参考：https://gproxy.leenhawk.com/guides/claude-caching/
  */
 
+// 设置存储键：保持 compress_cache 不变，改名会让已有用户的压缩/改写配置全部丢失。
 const MODULE_NAME = 'compress_cache';
-const LOG = '[压缩与缓存断点]';
+const LOG = '[压缩与改写]';
 
-// gproxy 官方固定魔法字符串（按 TTL）
-const GPROXY_MAGIC = Object.freeze({
-    'default': 'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_7D9ASD7A98SD7A9S8D79ASC98A7FNKJBVV80SCMSHDSIUCH',
-    '5m':      'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_49VA1S5V19GR4G89W2V695G9W9GV52W95V198WV5W2FC9DF',
-    '1h':      'GPROXY_MAGIC_STRING_TRIGGER_CACHING_CREATE_1FAS5GV9R5H29T5Y2J9584K6O95M2NBVW52C95CX984FRJY',
-});
+// 旧版「缓存断点」功能遗留的设置键，加载时清理一次。
+const LEGACY_SETTING_KEYS = Object.freeze([
+    'cacheMode', 'gpDefault', 'gp5m', 'gp1h',
+    'bpCompression', 'bpLastAssistant', 'bpInput',
+]);
 
 let isCompressing = false;
 let isRewriting = false;
@@ -131,16 +122,6 @@ const DEFAULT_SETTINGS = Object.freeze({
     autoTrigger: 'count',       // count：按用户输入条数；tokens：按历史 token 数
     autoTokens: 20000,          // 上次摘要之后的可见消息 token 数达到此值时自动压缩
 
-    // —— 缓存断点 ——
-    cacheMode: 'magic',         // magic（gproxy 魔法字符串） / off
-    gpDefault: GPROXY_MAGIC['default'],
-    gp5m:      GPROXY_MAGIC['5m'],
-    gp1h:      GPROXY_MAGIC['1h'],
-
-    bpCompression:   { enabled: false, ttl: '1h' },
-    bpLastAssistant: { enabled: true,  ttl: '5m' },
-    bpInput:         { enabled: true,  ttl: '5m' },
-
     // —— 自定义连接（压缩 / 改写各自独立配置）——
     // 注意：这里的“预设”指 ST 的代理预设（proxies 里带 url / 账号密码的那条），
     // 不是破限或提示词预设。source 为空表示跟随当前连接。
@@ -159,10 +140,9 @@ function getSettings() {
     for (const k of Object.keys(DEFAULT_SETTINGS)) {
         if (!Object.hasOwn(s, k)) s[k] = structuredClone(DEFAULT_SETTINGS[k]);
     }
-    for (const bp of ['bpCompression', 'bpLastAssistant', 'bpInput']) {
-        if (typeof s[bp] !== 'object' || s[bp] === null) s[bp] = structuredClone(DEFAULT_SETTINGS[bp]);
-        if (!Object.hasOwn(s[bp], 'enabled')) s[bp].enabled = DEFAULT_SETTINGS[bp].enabled;
-        if (!Object.hasOwn(s[bp], 'ttl')) s[bp].ttl = DEFAULT_SETTINGS[bp].ttl;
+    // 清掉旧版缓存断点留下的设置，避免死配置一直躺在 settings.json 里
+    for (const k of LEGACY_SETTING_KEYS) {
+        if (Object.hasOwn(s, k)) delete s[k];
     }
     for (const conn of ['connCompress', 'connRewrite']) {
         if (typeof s[conn] !== 'object' || s[conn] === null) s[conn] = structuredClone(DEFAULT_SETTINGS[conn]);
@@ -201,68 +181,19 @@ function isSummaryMessage(m) {
     return !!(m && m.extra && m.extra[MODULE_NAME] && m.extra[MODULE_NAME].isCompression);
 }
 
-// 按 TTL 取 gproxy 触发串
-function markerForTtl(s, ttl) {
-    if (ttl === '5m') return s.gp5m || GPROXY_MAGIC['5m'];
-    if (ttl === '1h') return s.gp1h || GPROXY_MAGIC['1h'];
-    return s.gpDefault || GPROXY_MAGIC['default'];
-}
-
 // ============================================================
-//  生成拦截器：注入缓存断点魔法字符串（全局函数，供 manifest 引用）
+//  生成拦截器：注入主路径任务的指令（全局函数，供 manifest 引用）
 // ============================================================
 
-// 合并类“提示词后处理”会把相邻同角色消息拼成一个字符串：若预设在对话记录后
-// 还有同角色固定提示词，会被拼进被标记的输入消息里，导致该断点每轮都 miss。
-// （Claude 源不受影响：其合并保留独立 text block，gproxy 按 block 打标。）
-let mergeRiskWarned = false;
-function warnIfMergeRisk(s) {
+globalThis.compressRewriteInterceptor = async function (chat, _contextSize, _abort, _type) {
     try {
-        if (mergeRiskWarned || !s.bpInput.enabled) return;
-        const cc = SillyTavern.getContext().chatCompletionSettings;
-        if (!cc) return;
-        const merging = ['claude', 'merge', 'merge_tools', 'semi', 'semi_tools', 'strict', 'strict_tools', 'single']
-            .includes(String(cc.custom_prompt_post_processing || ''));
-        if (merging) {
-            mergeRiskWarned = true;
-            console.warn(LOG, '提示词后处理为合并类模式，「输入消息」断点可能因同角色消息合并而失效');
-            toastr.warning(
-                '当前“提示词后处理”为合并类模式：若预设在对话记录后紧跟同角色固定提示词，「输入消息」断点可能每轮失效。建议后处理选“无”，或直接使用 Claude 源。',
-                '压缩与缓存断点', { timeOut: 12000 });
-        }
-    } catch { /* 静默 */ }
-}
-
-globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort, type) {
-    try {
-        const s = getSettings();
         if (!Array.isArray(chat)) return;
 
-        // —— 使用主路径的任务（须先于 enabled/cacheMode 检查：任务指令必须注入）——
-        // 1) 改写缓存断点：Claude 只有在请求带缓存标记时才会查缓存，因此改写时打一个断点。
-        //    打在最后一条 user 消息上——与上一轮的「输入消息」断点位置一致，前缀完全相同，
-        //    纯命中已有缓存、不产生新写入。不打在待改写的 assistant 消息上（它马上要变，写了也浪费）。
-        // 2) 指令注入：任务指令以“追加的 user 消息”放在对话末尾，而不是走 quiet prompt。
-        //    ST 的 quiet prompt 固定以 system 角色注入在末尾；OpenAI 兼容源（如 gproxy 的
-        //    claudecode 后端）会把 system 上提，导致对话以 assistant 结尾，触发
-        //    “assistant prefill 不支持”400 错误。以 user 消息结尾对任何源都安全。
+        // 任务指令以“追加的 user 消息”放在对话末尾，而不是走 quiet prompt。
+        // ST 的 quiet prompt 固定以 system 角色注入在末尾；部分 OpenAI 兼容中转会把
+        // system 上提，导致对话以 assistant 结尾，触发“assistant prefill 不支持”400
+        // 错误。以 user 消息结尾对任何源都安全。
         if ((isRewriting || isCompressing) && pendingTaskInjection) {
-            // 压缩走主路径时仍不添加缓存断点。
-            const useMarker = isRewriting && s.enabled && s.cacheMode === 'magic';
-            if (useMarker) {
-                for (let i = chat.length - 1; i >= 0; i--) {
-                    const m = chat[i];
-                    if (m && m.is_user === true && m.is_system !== true) {
-                        const marker = markerForTtl(s, s.bpInput.ttl);
-                        if (marker) {
-                            const clone = structuredClone(m);
-                            clone.mes = (clone.mes ?? '') + '\n' + marker;
-                            chat[i] = clone;
-                        }
-                        break;
-                    }
-                }
-            }
             const ctx = SillyTavern.getContext();
             chat.push({
                 name: ctx?.name1 || 'User',
@@ -272,38 +203,7 @@ globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort
                 mes: pendingTaskInjection,
                 extra: {},
             });
-            return;
         }
-
-        if (!s.enabled || s.cacheMode !== 'magic') return;
-        if (isCompressing || isRewriting || type === 'quiet') return;
-
-        warnIfMergeRisk(s);
-
-        let idxCompression = -1, idxLastAssistant = -1, idxInput = -1;
-        for (let i = chat.length - 1; i >= 0; i--) {
-            const m = chat[i];
-            if (!m) continue;
-            if (idxCompression === -1 && isSummaryMessage(m)) idxCompression = i;
-            if (idxLastAssistant === -1 && m.is_user === false && m.is_system !== true) idxLastAssistant = i;
-            if (idxInput === -1 && m.is_user === true && m.is_system !== true) idxInput = i;
-            if (idxCompression !== -1 && idxLastAssistant !== -1 && idxInput !== -1) break;
-        }
-
-        const applied = new Set();
-        const apply = (idx, ttl) => {
-            if (idx < 0 || applied.has(idx)) return;
-            const marker = markerForTtl(s, ttl);
-            if (!marker) return;
-            const clone = structuredClone(chat[idx]);
-            clone.mes = (clone.mes ?? '') + '\n' + marker;
-            chat[idx] = clone;
-            applied.add(idx);
-        };
-
-        if (s.bpCompression.enabled)   apply(idxCompression,   s.bpCompression.ttl);
-        if (s.bpLastAssistant.enabled) apply(idxLastAssistant, s.bpLastAssistant.ttl);
-        if (s.bpInput.enabled)         apply(idxInput,         s.bpInput.ttl);
     } catch (e) {
         console.error(LOG, '拦截器出错：', e);
     }
@@ -727,7 +627,7 @@ function apiUrlFieldsForSource(settings, source) {
 //  自定义连接（源 / 代理预设 / 模型）
 // ============================================================
 // 说明：这里说的“预设”是 ST 的**代理预设**——即 Connection Profiles 里那条
-// 带 url / 账号密码、用于连接中转（如 gproxy）的记录，不是破限或提示词预设。
+// 带 url / 账号密码、用于连接中转的记录，不是破限或提示词预设。
 // 用户既可以从 ST 现有代理预设里挑，也可以手填 url / 密码覆盖。
 
 // 换源时要清掉的、只对特定源有意义的字段；残留这些字段会让后端报 400。
@@ -950,8 +850,8 @@ async function requestRewriteToolRepair(ctx, original, instruction, draft, conn,
     };
 
     try {
-        // 独立自定义请求不经过 generate 拦截器管线，因此不会带魔法字符串缓存标记，
-        // 也不会改变主对话的严格缓存前缀；请求本身只含上面的三段修复材料。
+        // 独立自定义请求不经过 generate 拦截器管线，不会改动主对话的请求；
+        // 请求本身只含上面的三段修复材料。
         // 预设通过 options.presetName 应用，不切换全局选中预设。
         let data = await service.processRequest(payload, { presetName }, false);
         if (data && typeof data.json === 'function') data = await data.json();
@@ -1007,7 +907,7 @@ function stripCodeFence(text) {
 }
 
 // ST 的 quiet 生成不支持流式。主路径流式改写的做法：照常走 quiet 生成，让 ST 构建完整请求体
-// （预设参数、世界书、拦截器注入的改写指令与缓存断点都已就位），在 CHAT_COMPLETION_SETTINGS_READY
+// （预设参数、世界书、拦截器注入的改写指令都已就位），在 CHAT_COMPLETION_SETTINGS_READY
 // 时捕获请求体并调用 stopGeneration()——它同步中止 quiet 请求所用的全局 abortController，
 // 随后的 fetch 以已中止的信号立即失败，不会发出网络请求；再由我们以 stream:true 重发同一请求体。
 // 非 Chat Completion API（没触发该事件）时 body 为 null，直接沿用 quiet 生成的结果。
@@ -1087,7 +987,7 @@ async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction, conn) 
             pendingTaskInjection = null;
             if (!captured.body) return String(captured.fallback ?? '');
             body = captured.body;
-            // 自定义连接只覆盖请求体里的连接字段，其余（预设参数、世界书、缓存断点）原样保留
+            // 自定义连接只覆盖请求体里的连接字段，其余（预设参数、世界书）原样保留
             applyConnectionOverrides(body, conn);
         } else {
             const settings = ctx.chatCompletionSettings || {};
@@ -1429,10 +1329,6 @@ function addRewriteMenuButton() {
 // ============================================================
 //  设置面板 UI
 // ============================================================
-function ttlOptions(val) {
-    const opt = (v, label) => `<option value="${v}"${val === v ? ' selected' : ''}>${label}</option>`;
-    return opt('default', 'default（渠道默认）') + opt('5m', '5m') + opt('1h', '1h');
-}
 
 // ST 的 Chat Completion 源列表（与 openai.js 的 chat_completion_sources 对应）
 const CC_SOURCES = Object.freeze([
@@ -1609,7 +1505,7 @@ function buildSettingsHtml() {
     <div class="compress-cache-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>压缩与缓存断点</b>
+          <b>压缩与改写</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -1707,11 +1603,11 @@ ${buildConnectionHtml('compress', '压缩连接（源 / 代理预设 / 模型）
             <input id="cc_rw_main_preset" type="checkbox" />
             <span>使用主路径预设</span>
           </label>
-          <small class="notes">开启后带上当前主对话的预设、世界书和上下文，并复用主对话缓存；关闭时仅发送未隐藏的聊天内容和改写指令，不添加主对话缓存断点。默认开启。</small>
+          <small class="notes">开启后带上当前主对话的预设、世界书和上下文；关闭时仅发送未隐藏的聊天内容和改写指令。默认开启。</small>
 
           <label for="cc_rw_preset">改写用预设</label>
           <select id="cc_rw_preset" class="text_pole cc_preset_select"></select>
-          <small class="notes">改写时临时切换到此预设，完成后切回。选了与主对话不同的预设时，提示词前缀不同，无法复用主对话缓存。<br>注意：切换预设会重新载入预设文件，当前预设未保存的改动会丢失，请先保存。</small>
+          <small class="notes">改写时临时切换到此预设，完成后切回。<br>注意：切换预设会重新载入预设文件，当前预设未保存的改动会丢失，请先保存。</small>
 ${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）',
         '开启后改写请求会走这里指定的源、代理和模型；结构修复请求也一并跟随。开了「使用主路径预设」时提示词仍由主路径构建，只替换连接。')}
 
@@ -1722,7 +1618,7 @@ ${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）'
 
           <label class="checkbox_label" for="cc_rw_repair">
             <input id="cc_rw_repair" type="checkbox" />
-            <span>解析失败时用独立工具调用修复（不影响缓存）</span>
+            <span>解析失败时用独立工具调用修复（不改动主对话）</span>
           </label>
 
           <label class="checkbox_label" for="cc_rw_stream">
@@ -1732,57 +1628,7 @@ ${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）'
 
           <label for="cc_rw_prompt">改写提示词</label>
           <textarea id="cc_rw_prompt" class="text_pole textarea_compact" rows="4"></textarea>
-          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。使用主路径预设时可复用已有缓存前缀。</small>
-
-          <hr>
-          <h4>缓存断点（gproxy 魔法字符串）</h4>
-
-          <label for="cc_mode">断点开关</label>
-          <select id="cc_mode" class="text_pole">
-            <option value="magic">开启（魔法字符串）</option>
-            <option value="off">关闭</option>
-          </select>
-          <small class="notes">需在 gproxy 对应渠道打开 “Magic-string cache”。每次请求最多 4 个缓存标记，本扩展最多用 3 个。</small>
-
-          <table class="cc_bp_table" style="width:100%; margin-top:8px;">
-            <tr>
-              <th style="text-align:left;">断点</th>
-              <th style="width:80px;">启用</th>
-              <th style="width:150px;">TTL</th>
-            </tr>
-            <tr>
-              <td>上次压缩结果</td>
-              <td><input id="cc_bp1_en" type="checkbox" /></td>
-              <td><select id="cc_bp1_ttl" class="text_pole">${ttlOptions('1h')}</select></td>
-            </tr>
-            <tr>
-              <td>倒数第一条 assistant</td>
-              <td><input id="cc_bp2_en" type="checkbox" /></td>
-              <td><select id="cc_bp2_ttl" class="text_pole">${ttlOptions('5m')}</select></td>
-            </tr>
-            <tr>
-              <td>输入消息（最后一条 user）</td>
-              <td><input id="cc_bp3_en" type="checkbox" /></td>
-              <td><select id="cc_bp3_ttl" class="text_pole">${ttlOptions('5m')}</select></td>
-            </tr>
-          </table>
-          <small class="notes">断点仅进入本次请求、不写回存档；gproxy 会在发送前移除触发串。</small>
-
-          <div class="inline-drawer" style="margin-top:8px;">
-            <div class="inline-drawer-toggle inline-drawer-header">
-              <b>高级：gproxy 触发串</b>
-              <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
-              <small class="notes">一般无需改动；仅当 gproxy 更新了魔法字符串时覆盖。</small>
-              <label for="cc_gp_default">default</label>
-              <input id="cc_gp_default" type="text" class="text_pole" />
-              <label for="cc_gp_5m">5m</label>
-              <input id="cc_gp_5m" type="text" class="text_pole" />
-              <label for="cc_gp_1h">1h</label>
-              <input id="cc_gp_1h" type="text" class="text_pole" />
-            </div>
-          </div>
+          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。</small>
 
         </div>
       </div>
@@ -1880,16 +1726,6 @@ async function refreshUI() {
     $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
     $('#cc_rw_stream').prop('checked', s.rewriteStream);
     $('#cc_rw_prompt').val(s.rewritePrompt);
-    $('#cc_mode').val(s.cacheMode);
-    $('#cc_bp1_en').prop('checked', s.bpCompression.enabled);
-    $('#cc_bp1_ttl').val(s.bpCompression.ttl);
-    $('#cc_bp2_en').prop('checked', s.bpLastAssistant.enabled);
-    $('#cc_bp2_ttl').val(s.bpLastAssistant.ttl);
-    $('#cc_bp3_en').prop('checked', s.bpInput.enabled);
-    $('#cc_bp3_ttl').val(s.bpInput.ttl);
-    $('#cc_gp_default').val(s.gpDefault);
-    $('#cc_gp_5m').val(s.gp5m);
-    $('#cc_gp_1h').val(s.gp1h);
     refreshCounterDisplay();
 }
 
@@ -1940,19 +1776,6 @@ function bindUI() {
     $('#cc_rw_stream').on('change', function () { s.rewriteStream = $(this).prop('checked'); save(); });
     $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
 
-    $('#cc_mode').on('change', function () { s.cacheMode = String($(this).val()); save(); });
-
-    $('#cc_bp1_en').on('change', function () { s.bpCompression.enabled = $(this).prop('checked'); save(); });
-    $('#cc_bp1_ttl').on('change', function () { s.bpCompression.ttl = String($(this).val()); save(); });
-    $('#cc_bp2_en').on('change', function () { s.bpLastAssistant.enabled = $(this).prop('checked'); save(); });
-    $('#cc_bp2_ttl').on('change', function () { s.bpLastAssistant.ttl = String($(this).val()); save(); });
-    $('#cc_bp3_en').on('change', function () { s.bpInput.enabled = $(this).prop('checked'); save(); });
-    $('#cc_bp3_ttl').on('change', function () { s.bpInput.ttl = String($(this).val()); save(); });
-
-    $('#cc_gp_default').on('input', function () { s.gpDefault = String($(this).val()); save(); });
-    $('#cc_gp_5m').on('input', function () { s.gp5m = String($(this).val()); save(); });
-    $('#cc_gp_1h').on('input', function () { s.gp1h = String($(this).val()); save(); });
-
     $('#cc_run').on('click', async function () {
         const n = parseInt($('#cc_run_input').val());
         await runCompression(Number.isFinite(n) && n > 0 ? n : undefined);
@@ -1985,7 +1808,7 @@ function registerSlashCommand() {
         }));
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'rewrite',
-            helpString: '按指令局部改写最后一条 AI 回复（原文存为 swipe，缓存前缀保留）。用法：/rewrite 把结尾改含蓄一点',
+            helpString: '按指令局部改写最后一条 AI 回复（原文存为 swipe）。用法：/rewrite 把结尾改含蓄一点',
             callback: async (_named, unnamed) => {
                 await runRewrite(String(unnamed ?? ''));
                 return '';
