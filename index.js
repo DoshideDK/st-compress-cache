@@ -464,7 +464,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
     let result = '';
     const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在压缩上下文…' }) : null;
     isCompressing = true;
-    const conn = resolveConnection(s, 'connCompress');
+    const conn = await resolveConnection(s, 'connCompress');
     if (conn) warnConnection(conn, '压缩');
     try {
         result = await withPreset(s.compressPreset, async () => {
@@ -744,24 +744,59 @@ const SOURCE_SPECIFIC_FIELDS = Object.freeze([
     'secret_id',
 ]);
 
-function findProxyPreset(name) {
-    if (!name) return null;
-    try {
-        const list = SillyTavern.getContext().proxies;
-        if (!Array.isArray(list)) return null;
-        return list.find(p => p && p.name === name) || null;
-    } catch {
-        return null;
+// 代理预设列表。
+// 注意：ST 的 getContext() **不暴露** proxies（只有 script.js 内部那个 getSettings 上下文里才有），
+// 扩展拿不到，所以这里从 /api/settings/get 读原始设置。
+// 优先级：ctx.proxies（万一将来暴露了）> 服务器设置文件里的 proxies。
+let proxyListCache = null;
+
+async function loadProxyPresets(force = false) {
+    if (!force && proxyListCache) return proxyListCache;
+
+    const ctx = SillyTavern.getContext();
+    const live = ctx.proxies;
+    if (Array.isArray(live) && live.length) {
+        proxyListCache = live;
+        return proxyListCache;
     }
+
+    try {
+        const headers = typeof ctx.getRequestHeaders === 'function'
+            ? ctx.getRequestHeaders()
+            : { 'Content-Type': 'application/json' };
+        const response = await fetch('/api/settings/get', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({}),
+            cache: 'no-cache',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        // settings 字段是 JSON 字符串；代理预设既可能在根上，也可能在 oai_settings 里
+        const settings = typeof data?.settings === 'string' ? JSON.parse(data.settings) : (data?.settings ?? {});
+        const list = settings?.proxies ?? settings?.oai_settings?.proxies;
+        proxyListCache = Array.isArray(list) ? list : [];
+    } catch (e) {
+        console.warn(LOG, '读取代理预设失败，代理下拉将为空：', e);
+        proxyListCache = proxyListCache || [];
+    }
+    return proxyListCache;
+}
+
+// 找到指定名字的代理预设；返回 { name, url, password } 或 null
+async function findProxyPreset(name) {
+    if (!name) return null;
+    const list = await loadProxyPresets();
+    return list.find(p => p && p.name === name) || null;
 }
 
 // 把一条自定义连接配置解析成实际要用的连接参数；未启用时返回 null（表示走原逻辑）
-function resolveConnection(s, key) {
+async function resolveConnection(s, key) {
     const c = s?.[key];
     if (!c || !c.enabled) return null;
 
     const ctxSettings = SillyTavern.getContext().chatCompletionSettings || {};
-    const preset = findProxyPreset(c.proxyPreset);
+    const preset = await findProxyPreset(c.proxyPreset);
 
     // 优先级：手填 > 代理预设 > 当前连接。手填便于覆盖代理预设里的旧 url/密码。
     const reverseProxy = String(c.proxyUrl || preset?.url || '').trim();
@@ -1120,7 +1155,7 @@ async function runRewrite(instruction) {
     ].join('\n\n');
 
     let result = '';
-    const conn = resolveConnection(s, 'connRewrite');
+    const conn = await resolveConnection(s, 'connRewrite');
     if (conn) warnConnection(conn, '改写');
     // 整条重写 + 流式：不显示遮罩，让生成过程直接显示在原消息上
     const streaming = !s.rewriteDiffMode && s.rewriteStream && ctx.mainApi === 'openai'
@@ -1659,17 +1694,20 @@ ${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）'
 }
 
 let lastPresetNamesKey = null;
-function refreshPresetOptions() {
+// force=true 时重新拉一次代理预设列表（用户刚在 ST 里加了代理，不该等到刷新页面）
+async function refreshPresetOptions(force = false) {
     const s = getSettings();
     let names = [];
     try {
         const pm = SillyTavern.getContext().getPresetManager?.('openai');
         if (pm) names = pm.getAllPresets();
     } catch { /* 预设管理器未就绪 */ }
+
+    const proxies = await loadProxyPresets(force);
     const key = JSON.stringify([
         names, s.compressPreset, s.rewritePreset,
         s.connCompress, s.connRewrite,
-        SillyTavern.getContext().proxies,
+        proxies.map(p => p?.name),
     ]);
     if (key === lastPresetNamesKey) return;
     lastPresetNamesKey = key;
@@ -1684,7 +1722,7 @@ function refreshPresetOptions() {
     };
     fill('#cc_compress_preset', s.compressPreset);
     fill('#cc_rw_preset', s.rewritePreset);
-    refreshConnectionUI(s);
+    await refreshConnectionUI(s);
 }
 
 const CC_CONN_TASKS = Object.freeze([
@@ -1693,10 +1731,10 @@ const CC_CONN_TASKS = Object.freeze([
 ]);
 
 // 刷新「自定义连接」区域的三个下拉与显隐
-function refreshConnectionUI(s) {
+async function refreshConnectionUI(s, force = false) {
     const ctx = SillyTavern.getContext();
-    const proxies = Array.isArray(ctx.proxies) ? ctx.proxies : [];
     const settings = ctx.chatCompletionSettings || {};
+    const proxies = await loadProxyPresets(force);
 
     for (const [taskId, key] of CC_CONN_TASKS) {
         const c = s[key];
@@ -1727,9 +1765,9 @@ function refreshConnectionUI(s) {
     }
 }
 
-function refreshUI() {
+async function refreshUI() {
     const s = getSettings();
-    refreshPresetOptions();
+    await refreshPresetOptions();
     for (const [taskId, key] of CC_CONN_TASKS) {
         const c = s[key];
         const id = `cc_conn_${taskId}`;
@@ -1780,7 +1818,7 @@ function bindUI() {
     $('#cc_rw_preset').on('change', function () { s.rewritePreset = String($(this).val() ?? ''); save(); });
     // 展开下拉前刷新列表，跟上预设的新增/改名/删除
     // （同时会刷新代理预设下拉与模型候选）
-    $('.cc_preset_select').on('mousedown focus', refreshPresetOptions);
+    $('.cc_preset_select').on('mousedown focus', () => refreshPresetOptions(true));
 
     for (const [taskId, key] of CC_CONN_TASKS) {
         const c = () => s[key];
@@ -1881,7 +1919,7 @@ jQuery(async () => {
         const ctx = SillyTavern.getContext();
         getSettings();
         $('#extensions_settings2').append(buildSettingsHtml());
-        refreshUI();
+        await refreshUI();
         bindUI();
         addOptionsMenuButton();
         addRewriteMenuButton();
