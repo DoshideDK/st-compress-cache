@@ -1464,6 +1464,76 @@ const CC_SOURCES = Object.freeze([
     ['minimax', 'MiniMax'],
 ]);
 
+// 源 → ST 自己那个模型下拉的 DOM id。
+// 用 ST 已经拉好的列表，避免我们自己再打一次 /status 接口（那需要凭据，还可能失败）。
+// 注意 makersuite 的 select 叫 model_google_select。
+const MODEL_SELECT_BY_SOURCE = Object.freeze({
+    openai: '#model_openai_select',
+    claude: '#model_claude_select',
+    openrouter: '#model_openrouter_select',
+    ai21: '#model_ai21_select',
+    makersuite: '#model_google_select',
+    vertexai: '#model_vertexai_select',
+    mistralai: '#model_mistralai_select',
+    groq: '#model_groq_select',
+    siliconflow: '#model_siliconflow_select',
+    minimax: '#model_minimax_select',
+    electronhub: '#model_electronhub_select',
+    chutes: '#model_chutes_select',
+    nanogpt: '#model_nanogpt_select',
+    workers_ai: '#model_workers_ai_select',
+    deepseek: '#model_deepseek_select',
+    fireworks: '#model_fireworks_select',
+    cometapi: '#model_cometapi_select',
+    perplexity: '#model_perplexity_select',
+    cohere: '#model_cohere_select',
+    custom: '#model_custom_select',
+});
+
+// 收集可选的模型 id：
+//   1) 该源在 ST 里的原生下拉（值就是 model.id，如 #model_claude_select）
+//   2) 目标源就是当前源的源时，再合并 custom 的 select 与 datalist
+//   3) 一个都没取到时，用该源当前的模型兜底，保证弹窗不空
+// 注意 getContext() 既不暴露 proxies 也不暴露 models，所以只能读 ST 已经填好的 DOM，
+// 这样也顺带避免了为了列模型去打 /status 接口（那需要凭据，还可能失败）。
+function collectModelCandidates(source, currentModel) {
+    const seen = new Set();
+    const out = [];
+    const push = (v) => {
+        const value = String(v ?? '').trim();
+        if (!value || value === 'None' || seen.has(value)) return;
+        seen.add(value);
+        out.push(value);
+    };
+
+    const readOptions = (selector) => {
+        try {
+            $(selector).find('option').each(function () {
+                push($(this).attr('value'));
+            });
+        } catch { /* 选择器取不到就跳过 */ }
+    };
+
+    const ctx = SillyTavern.getContext();
+    const currentSource = String(ctx.chatCompletionSettings?.chat_completion_source ?? '').toLowerCase();
+    const want = String(source ?? '').trim().toLowerCase();
+
+    // 目标源在 ST 里的原生下拉（值就是 model.id）
+    const primary = MODEL_SELECT_BY_SOURCE[want];
+    if (primary) readOptions(primary);
+
+    // 只有目标源就是当前连接的源（或没指定源）时，才把 ST 已加载的那份列表当兜底，
+    // 否则会把「当前源」的模型当成「别的源」的候选，误导人。
+    if (!want || want === currentSource) {
+        readOptions('#model_custom_select');
+        readOptions('#model_custom_select_fill');
+    }
+
+    // 一个都没取到时，至少把该源当前的模型放进去，让弹窗不是空的
+    if (out.length === 0) push(currentModel);
+    return out;
+}
+
 // 生成一块「自定义连接」设置区。taskId 用于区分压缩 / 改写的 DOM id 与设置键。
 function buildConnectionHtml(taskId, title, note) {
     const id = `cc_conn_${taskId}`;
@@ -1500,10 +1570,8 @@ function buildConnectionHtml(taskId, title, note) {
             </div>
 
             <label for="${id}_model">模型</label>
-            <input id="${id}_model" type="text" class="text_pole" list="${id}_models"
-                   placeholder="留空则用该源的当前模型" />
-            <datalist id="${id}_models"></datalist>
-            <small class="notes">可直接手填模型 id；下拉候选来自当前连接的模型列表。</small>
+            <select id="${id}_model" class="text_pole"></select>
+            <small class="notes">留空则用该源的当前模型。候选来自 ST 已加载的模型列表（跟着上面选的源走）。</small>
           </div>
 `;
 }
@@ -1748,18 +1816,15 @@ async function refreshConnectionUI(s, force = false) {
         }
         $proxy.val(c.proxyPreset || '');
 
-        const $dl = $(`#${id}_models`).empty();
-        const current = currentModelForSource(settings, c.source || settings.chat_completion_source);
-        if (current) $dl.append($('<option>').val(current));
-        try {
-            const list = ctx.models;
-            if (Array.isArray(list)) {
-                for (const m of list) {
-                    const value = typeof m === 'string' ? m : (m && (m.id || m.name));
-                    if (value) $dl.append($('<option>').val(value));
-                }
-            }
-        } catch { /* 模型列表不可用则只留当前模型 */ }
+        // 模型下拉：和上面的源下拉同样是普通 select，选项跟着所选源走
+        const source = c.source || settings.chat_completion_source;
+        const candidates = collectModelCandidates(source, c.model);
+        const $model = $(`#${id}_model`).empty();
+        $model.append($('<option>').val('').text('跟随该源的当前模型'));
+        for (const name of candidates) {
+            $model.append($('<option>').val(name).text(name));
+        }
+        $model.val(c.model || '');
 
         $(`.${id}_body`).toggle(!!c.enabled);
     }
@@ -1775,7 +1840,7 @@ async function refreshUI() {
         $(`#${id}_source`).val(c.source || '');
         $(`#${id}_proxy_url`).val(c.proxyUrl || '');
         $(`#${id}_proxy_pw`).val(c.proxyPassword || '');
-        $(`#${id}_model`).val(c.model || '');
+        // 模型 select 的选项与选中值由 refreshConnectionUI 负责
     }
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_auto').prop('checked', s.autoMode);
@@ -1828,11 +1893,15 @@ function bindUI() {
             save();
             refreshConnectionUI(s);
         });
-        $(`#${id}_source`).on('change', function () { c().source = String($(this).val() ?? ''); save(); });
+        $(`#${id}_source`).on('change', function () {
+            c().source = String($(this).val() ?? '');
+            save();
+            refreshConnectionUI(s);   // 换源后模型候选跟着变
+        });
         $(`#${id}_proxy`).on('change', function () { c().proxyPreset = String($(this).val() ?? ''); save(); });
         $(`#${id}_proxy_url`).on('input', function () { c().proxyUrl = String($(this).val() ?? ''); save(); });
         $(`#${id}_proxy_pw`).on('input', function () { c().proxyPassword = String($(this).val() ?? ''); save(); });
-        $(`#${id}_model`).on('input', function () { c().model = String($(this).val() ?? ''); save(); });
+        $(`#${id}_model`).on('change', function () { c().model = String($(this).val() ?? ''); save(); });
     }
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
