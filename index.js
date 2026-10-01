@@ -1516,22 +1516,50 @@ function collectModelCandidates(source, currentModel) {
 
     const ctx = SillyTavern.getContext();
     const currentSource = String(ctx.chatCompletionSettings?.chat_completion_source ?? '').toLowerCase();
-    const want = String(source ?? '').trim().toLowerCase();
+    // 没选源就等于跟随当前连接，所以先把「空」折叠成当前源，后面统一按有效源处理
+    const want = String(source ?? '').trim().toLowerCase() || currentSource;
 
     // 目标源在 ST 里的原生下拉（值就是 model.id）
     const primary = MODEL_SELECT_BY_SOURCE[want];
     if (primary) readOptions(primary);
 
-    // 只有目标源就是当前连接的源（或没指定源）时，才把 ST 已加载的那份列表当兜底，
+    // OpenAI 源的「External」是 #model_openai_select 里的一个 <optgroup>，
+    // 上面的 find('option') 已经能读到；这里再显式补一次，
+    // 免得哪天 ST 把它挪出这个 select。
+    if (want === 'openai') readOptions('#openai_external_category');
+
+    // 只有目标源就是当前连接的源时，才把 ST 已加载的那份列表当兜底，
     // 否则会把「当前源」的模型当成「别的源」的候选，误导人。
-    if (!want || want === currentSource) {
+    if (want === currentSource) {
         readOptions('#model_custom_select');
         readOptions('#model_custom_select_fill');
     }
 
-    // 一个都没取到时，至少把该源当前的模型放进去，让弹窗不是空的
-    if (out.length === 0) push(currentModel);
+    // 已保存的模型必须始终在列，否则用户换源再换回来时设置会被悄悄丢掉
+    push(currentModel);
     return out;
+}
+
+// 重建某一项的模型下拉选项。
+// 单独抽出来是因为它需要在「面板刷新」和「下拉获焦」两个时机都能跑：
+// ST 的外部模型列表是 /status 请求回来后异步填进 #openai_external_category 的，
+// 比扩展初始化晚，所以获焦时要重新读一次 DOM，否则拿到的是当时的空快照。
+function refreshModelOptions(taskId, conn) {
+    const settings = SillyTavern.getContext().chatCompletionSettings || {};
+    const id = `cc_conn_${taskId}`;
+    const source = conn.source || settings.chat_completion_source;
+    const candidates = collectModelCandidates(source, conn.model);
+
+    const $model = $(`#${id}_model`).empty();
+    $model.append($('<option>').val('').text('跟随该源的当前模型'));
+    for (const name of candidates) {
+        $model.append($('<option>').val(name).text(name));
+    }
+    // 之前存的值若不在候选里（例如源换了、ST 还没加载该源列表），补一项，别把设置悄悄丢掉
+    if (conn.model && !candidates.includes(conn.model)) {
+        $model.append($('<option>').val(conn.model).text(`${conn.model}（当前已设）`));
+    }
+    $model.val(conn.model || '');
 }
 
 // 生成一块「自定义连接」设置区。taskId 用于区分压缩 / 改写的 DOM id 与设置键。
@@ -1817,14 +1845,7 @@ async function refreshConnectionUI(s, force = false) {
         $proxy.val(c.proxyPreset || '');
 
         // 模型下拉：和上面的源下拉同样是普通 select，选项跟着所选源走
-        const source = c.source || settings.chat_completion_source;
-        const candidates = collectModelCandidates(source, c.model);
-        const $model = $(`#${id}_model`).empty();
-        $model.append($('<option>').val('').text('跟随该源的当前模型'));
-        for (const name of candidates) {
-            $model.append($('<option>').val(name).text(name));
-        }
-        $model.val(c.model || '');
+        refreshModelOptions(taskId, c);
 
         $(`.${id}_body`).toggle(!!c.enabled);
     }
@@ -1902,6 +1923,8 @@ function bindUI() {
         $(`#${id}_proxy_url`).on('input', function () { c().proxyUrl = String($(this).val() ?? ''); save(); });
         $(`#${id}_proxy_pw`).on('input', function () { c().proxyPassword = String($(this).val() ?? ''); save(); });
         $(`#${id}_model`).on('change', function () { c().model = String($(this).val() ?? ''); save(); });
+        // 展开前重读一次 ST 的模型列表，跟上 ST 异步加载进来的 External 模型
+        $(`#${id}_model`).on('focus mousedown', function () { refreshModelOptions(taskId, c()); });
     }
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
