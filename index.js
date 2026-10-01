@@ -100,9 +100,9 @@ const DEFAULT_SETTINGS = Object.freeze({
         'preamble and no explanations.',
     compressRole: 'assistant',  // 摘要写回时的角色：assistant / user
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
-    compressKeepLast: 0,        // 摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏
-    compressIncludeKept: true,  // 保留的 N 条是否也发送给模型并一起总结
-    summaryPrefix: '【压缩记忆】\n',
+    compressKeepLast: 4,        // 摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏
+    compressIncludeKept: false, // 保留的 N 条是否也发送给模型并一起总结
+    summaryPrefix: '【压缩摘要】\n',
 
     // —— 改写上一条 ——
     rewriteUseMainPreset: true, // 默认保留完整主路径；关闭时仅发送可见聊天和改写指令
@@ -117,15 +117,15 @@ const DEFAULT_SETTINGS = Object.freeze({
         'language as the original reply.',
 
     // —— 模式 ——
-    autoMode: false,            // 自动模式开关（关闭即手动模式）
+    autoMode: true,             // 自动模式开关（关闭即手动模式）
     autoEvery: 10,              // 用户每发送多少条消息自动压缩一次
-    autoTrigger: 'count',       // count：按用户输入条数；tokens：按历史 token 数
-    autoTokens: 20000,          // 上次摘要之后的可见消息 token 数达到此值时自动压缩
+    autoTrigger: 'tokens',      // count：按用户输入条数；tokens：按历史 token 数
+    autoTokens: 12000,          // 上次摘要之后的可见消息 token 数达到此值时自动压缩
 
     // —— 自定义连接（压缩 / 改写各自独立配置）——
     // 注意：这里的“预设”指 ST 的代理预设（proxies 里带 url / 账号密码的那条），
     // 不是破限或提示词预设。source 为空表示跟随当前连接。
-    connCompress: { enabled: false, source: '', proxyPreset: '', proxyUrl: '', proxyPassword: '', model: '' },
+    connCompress: { enabled: true, source: 'openai', proxyPreset: 'api', proxyUrl: '', proxyPassword: '', model: 'deepseek-flash' },
     connRewrite:  { enabled: false, source: '', proxyPreset: '', proxyUrl: '', proxyPassword: '', model: '' },
 });
 
