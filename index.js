@@ -87,6 +87,8 @@ const REWRITE_REPAIR_SCHEMA = Object.freeze({
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
+    menuCompress: true,         // 是否在左下角“选项”菜单注入“压缩上下文”
+    menuRewrite: true,          // 是否在左下角“选项”菜单注入“改写上一条”
 
     // —— 压缩 ——
     compressUseMainPreset: false, // 开启时使用主路径的预设、世界书和聊天上下文
@@ -1276,38 +1278,45 @@ function refreshCounterDisplay(knownTokens) {
 // ============================================================
 //  “选项”菜单按钮（与 重新生成 / AI帮答 / 续写 同级）
 // ============================================================
-function addOptionsMenuButton() {
-    if ($('#option_compress_context').length) return;
-    const html = `
+// 按设置注入/移除按钮：总开关关闭或对应开关关闭时不改动 ST 的菜单
+function insertMenuItem(html, preferAnchor) {
+    const $anchor = $(preferAnchor).length ? $(preferAnchor) : $('#option_continue');
+    if ($anchor.length) $anchor.first().after(html);
+    else $('#options .options-content').append(html);
+}
+
+function syncMenuButtons() {
+    const s = getSettings();
+    const wantCompress = !!(s.enabled && s.menuCompress);
+    const wantRewrite = !!(s.enabled && s.menuRewrite);
+
+    if (wantCompress && !$('#option_compress_context').length) {
+        insertMenuItem(`
         <a id="option_compress_context" class="interactable" tabindex="0">
             <i class="fa-lg fa-solid fa-file-zipper"></i>
             <span>压缩上下文</span>
-        </a>`;
-    const $anchor = $('#option_continue');
-    if ($anchor.length) {
-        $anchor.after(html);
-    } else {
-        $('#options .options-content').append(html);
+        </a>`, '#option_continue');
+    } else if (!wantCompress) {
+        $('#option_compress_context').remove();
     }
+
+    if (wantRewrite && !$('#option_rewrite_last').length) {
+        insertMenuItem(`
+        <a id="option_rewrite_last" class="interactable" tabindex="0">
+            <i class="fa-lg fa-solid fa-pen-nib"></i>
+            <span>改写上一条</span>
+        </a>`, '#option_compress_context');
+    } else if (!wantRewrite) {
+        $('#option_rewrite_last').remove();
+    }
+}
+
+// 委托事件只绑定一次，按钮移除/重建都无需重绑
+function bindMenuHandlers() {
     $(document).on('click', '#option_compress_context', async function () {
         try { $('#options').hide(); } catch { /* ignore */ }
         await runCompression();
     });
-}
-
-function addRewriteMenuButton() {
-    if ($('#option_rewrite_last').length) return;
-    const html = `
-        <a id="option_rewrite_last" class="interactable" tabindex="0">
-            <i class="fa-lg fa-solid fa-pen-nib"></i>
-            <span>改写上一条</span>
-        </a>`;
-    const $anchor = $('#option_compress_context');
-    if ($anchor.length) {
-        $anchor.after(html);
-    } else {
-        $('#options .options-content').append(html);
-    }
     $(document).on('click', '#option_rewrite_last', async function () {
         try { $('#options').hide(); } catch { /* ignore */ }
         const $ta = $('#send_textarea');
@@ -1505,6 +1514,15 @@ function buildSettingsHtml() {
             <input id="cc_enabled" type="checkbox" />
             <span>启用本扩展</span>
           </label>
+          <label class="checkbox_label" for="cc_menu_compress">
+            <input id="cc_menu_compress" type="checkbox" />
+            <span>在左下角菜单显示「压缩上下文」</span>
+          </label>
+          <label class="checkbox_label" for="cc_menu_rewrite">
+            <input id="cc_menu_rewrite" type="checkbox" />
+            <span>在左下角菜单显示「改写上一条」</span>
+          </label>
+          <small class="notes">关闭扩展或对应开关时，不会向左下角菜单注入按钮。</small>
 
           <hr>
           <h4>压缩模式</h4>
@@ -1701,6 +1719,8 @@ async function refreshUI() {
         // 模型 select 的选项与选中值由 refreshConnectionUI 负责
     }
     $('#cc_enabled').prop('checked', s.enabled);
+    $('#cc_menu_compress').prop('checked', s.menuCompress);
+    $('#cc_menu_rewrite').prop('checked', s.menuRewrite);
     $('#cc_auto').prop('checked', s.autoMode);
     $('#cc_auto_every').val(s.autoEvery);
     $('#cc_compress_main_preset').prop('checked', s.compressUseMainPreset);
@@ -1723,7 +1743,9 @@ async function refreshUI() {
 function bindUI() {
     const s = getSettings();
 
-    $('#cc_enabled').on('change', function () { s.enabled = $(this).prop('checked'); save(); });
+    $('#cc_enabled').on('change', function () { s.enabled = $(this).prop('checked'); save(); syncMenuButtons(); });
+    $('#cc_menu_compress').on('change', function () { s.menuCompress = $(this).prop('checked'); save(); syncMenuButtons(); });
+    $('#cc_menu_rewrite').on('change', function () { s.menuRewrite = $(this).prop('checked'); save(); syncMenuButtons(); });
     $('#cc_auto').on('change', function () { s.autoMode = $(this).prop('checked'); save(); refreshCounterDisplay(); });
     $('#cc_auto_every').on('input', function () { s.autoEvery = Math.max(1, parseInt($(this).val()) || 10); save(); refreshCounterDisplay(); });
     $('#cc_compress_main_preset').on('change', function () { s.compressUseMainPreset = $(this).prop('checked'); save(); });
@@ -1827,8 +1849,8 @@ jQuery(async () => {
         $('#extensions_settings2').append(buildSettingsHtml());
         await refreshUI();
         bindUI();
-        addOptionsMenuButton();
-        addRewriteMenuButton();
+        bindMenuHandlers();
+        syncMenuButtons();
         registerSlashCommand();
 
         const { eventSource, event_types } = ctx;
