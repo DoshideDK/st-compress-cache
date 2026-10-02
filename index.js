@@ -158,15 +158,24 @@ function save() {
 }
 
 // —— 用户轮数：与 token 计数一致，直接由当前聊天内容实时推算 ——
-// 上一次摘要之后、可见（非隐藏）、非摘要的用户消息条数。
+// 上一次摘要之后、可见（非隐藏）、非摘要消息中，“user + AI 回复”才算一轮：
+// 连续多条 user 后跟一条 AI 只算一轮；user 已发出但 AI 尚未回复不算。
 // 不再使用累加计数器，因此 fork、删除、取消隐藏、切换聊天等都能保持准确。
 function countUserTurns() {
     const chat = SillyTavern.getContext().chat;
     if (!Array.isArray(chat) || chat.length === 0) return 0;
     let n = 0;
+    let pendingUser = false;
     for (let i = findLastSummaryIndex(chat) + 1; i < chat.length; i++) {
         const m = chat[i];
-        if (m && m.is_user && m.is_system !== true && !isSummaryMessage(m)) n++;
+        if (!m || m.is_system === true || isSummaryMessage(m)) continue;
+        if (m.is_user) {
+            pendingUser = true;
+        } else if (pendingUser && String(m.mes ?? '').trim()) {
+            // 流式生成中的空占位不算
+            n++;
+            pendingUser = false;
+        }
     }
     return n;
 }
