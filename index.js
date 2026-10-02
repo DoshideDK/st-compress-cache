@@ -157,24 +157,18 @@ function save() {
     SillyTavern.getContext().saveSettingsDebounced();
 }
 
-// —— 每聊天状态（用户输入计数，编辑重发不触发 MESSAGE_SENT，自然不计入） ——
-function getChatState() {
-    const md = SillyTavern.getContext().chatMetadata;
-    if (!md[MODULE_NAME] || typeof md[MODULE_NAME] !== 'object') {
-        md[MODULE_NAME] = { userMsgCount: 0 };
+// —— 用户轮数：与 token 计数一致，直接由当前聊天内容实时推算 ——
+// 上一次摘要之后、可见（非隐藏）、非摘要的用户消息条数。
+// 不再使用累加计数器，因此 fork、删除、取消隐藏、切换聊天等都能保持准确。
+function countUserTurns() {
+    const chat = SillyTavern.getContext().chat;
+    if (!Array.isArray(chat) || chat.length === 0) return 0;
+    let n = 0;
+    for (let i = findLastSummaryIndex(chat) + 1; i < chat.length; i++) {
+        const m = chat[i];
+        if (m && m.is_user && m.is_system !== true && !isSummaryMessage(m)) n++;
     }
-    if (!Object.hasOwn(md[MODULE_NAME], 'userMsgCount')) md[MODULE_NAME].userMsgCount = 0;
-    return md[MODULE_NAME];
-}
-
-function saveChatState() {
-    const ctx = SillyTavern.getContext();
-    try {
-        if (ctx.saveMetadataDebounced) ctx.saveMetadataDebounced();
-        else if (ctx.saveMetadata) ctx.saveMetadata();
-    } catch (e) {
-        console.warn(LOG, '保存聊天元数据失败：', e);
-    }
+    return n;
 }
 
 function isSummaryMessage(m) {
@@ -472,10 +466,6 @@ async function runCompression(countOverride, { silent = false } = {}) {
         }
     }
 
-    // 压缩完成后重置用户输入计数
-    const st = getChatState();
-    st.userMsgCount = 0;
-    saveChatState();
     refreshCounterDisplay();
 
     toastr.success(includeKept
@@ -1219,15 +1209,9 @@ async function runRewrite(instruction) {
 // ============================================================
 //  自动模式：事件监听
 // ============================================================
-function onMessageSent() {
-    try {
-        const st = getChatState();
-        st.userMsgCount = (st.userMsgCount || 0) + 1;
-        saveChatState();
-        refreshCounterDisplay();
-    } catch (e) {
-        console.warn(LOG, 'onMessageSent 出错：', e);
-    }
+function onChatMutated() {
+    // 等 ST 完成本次修改后再刷新显示
+    setTimeout(() => refreshCounterDisplay(), 100);
 }
 
 function onGenerationEnded() {
@@ -1249,9 +1233,8 @@ function onGenerationEnded() {
             }, 500);
             return;
         }
-        const st = getChatState();
         const every = Math.max(1, Number(s.autoEvery) || 10);
-        if ((st.userMsgCount || 0) >= every) {
+        if (countUserTurns() >= every) {
             // 回复已落库，此刻后台压缩安全
             setTimeout(() => runCompression(undefined, { silent: true }), 500);
         }
@@ -1276,9 +1259,8 @@ function refreshCounterDisplay(knownTokens) {
             }
             return;
         }
-        const st = getChatState();
         const every = Math.max(1, Number(s.autoEvery) || 10);
-        $('#cc_counter').text(`${st.userMsgCount || 0} / ${every}`);
+        $('#cc_counter').text(`${countUserTurns()} / ${every}`);
     } catch { /* UI 未就绪时忽略 */ }
 }
 
@@ -1841,7 +1823,9 @@ jQuery(async () => {
         registerSlashCommand();
 
         const { eventSource, event_types } = ctx;
-        eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+        for (const ev of ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_UPDATED', 'MESSAGE_SWIPED']) {
+            if (event_types[ev]) eventSource.on(event_types[ev], onChatMutated);
+        }
         eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
         eventSource.on(event_types.CHAT_CHANGED, () => refreshCounterDisplay());
 
