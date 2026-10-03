@@ -1,94 +1,37 @@
 /*
- * 压缩与改写 (Compress & Rewrite)
+ * 压缩 (Compress)
  * SillyTavern 第三方 UI 扩展
  *
- * 功能：
- *  1) 上下文压缩（两种模式）：
+ * 功能：上下文压缩（两种模式）
  *     - 手动模式（默认）：压缩“上一次压缩点之后”的全部消息；也可指定条数。
  *     - 自动模式：用户每发送 N 条消息（编辑重发不计入），在当次回复结束后
  *       自动压缩上次压缩点之后的消息。自动模式开启时仍可随时手动压缩。
  *     触发入口：设置面板按钮、输入框旁“选项”菜单（重新生成/AI帮答/续写 同级）、/compress 命令。
  *     可设置“保留最近 N 条不压缩”，摘要插在这些消息之前。
- *  2) 改写上一条：在输入框写下改写要求，点“选项”菜单里的「改写上一条」或
- *     /rewrite 命令，对最后一条 AI 回复做局部改写（搜索替换块）或整条重写。
- *     指令不进存档；原文保存为 swipe。整条重写可流式输出。
- *     压缩和改写都可指定一个 Chat Completion 预设，执行期间临时切换、结束后切回。
+ *     可指定一个 Chat Completion 预设，执行期间临时切换、结束后切回。
  */
 
-// 设置存储键：保持 compress_cache 不变，改名会让已有用户的压缩/改写配置全部丢失。
+// 设置存储键：保持 compress_cache 不变，改名会让已有用户的压缩配置全部丢失。
 const MODULE_NAME = 'compress_cache';
-const LOG = '[压缩与改写]';
+const LOG = '[压缩]';
 
-// 旧版「缓存断点」功能遗留的设置键，加载时清理一次。
+// 旧版「缓存断点」功能与已移除的「改写上一条」功能遗留的设置键，加载时清理一次。
+// connRewrite 是对象，单独在 getSettings 里删除。
 const LEGACY_SETTING_KEYS = Object.freeze([
     'cacheMode', 'gpDefault', 'gp5m', 'gp1h',
     'bpCompression', 'bpLastAssistant', 'bpInput',
+    'menuRewrite', 'rewriteUseMainPreset', 'rewritePreset', 'rewriteDiffMode',
+    'rewriteToolRepair', 'rewriteStream', 'rewritePrompt',
 ]);
 
 let isCompressing = false;
-let isRewriting = false;
 // 使用主路径预设时，由拦截器以追加 user 消息的方式注入任务指令
 let pendingTaskInjection = null;
 
-// 改写输出格式说明（内部固定，不随用户提示词变化，保证可解析）
-const REWRITE_FORMAT_DIFF =
-    'Output ONLY one or more search-and-replace blocks in exactly this format, with nothing else:\n' +
-    '<<<<<<< SEARCH\n' +
-    '(an excerpt copied character-for-character from the latest assistant reply)\n' +
-    '=======\n' +
-    '(the replacement text)\n' +
-    '>>>>>>> REPLACE\n' +
-    'Rules: each SEARCH excerpt must appear verbatim in the reply and be unique within it; ' +
-    'keep excerpts as short as possible while remaining unique; prefer several small blocks ' +
-    'over one large block; do not rewrite parts the revision request does not touch.';
-
-const REWRITE_FORMAT_FULL =
-    'Output ONLY the complete revised reply, with no preamble, no commentary, and no surrounding quotes.';
-
-const REWRITE_TOOL_REPAIR_PROMPT =
-    'This is a formatting-repair task. Review the original assistant reply, the revision request, ' +
-    'and the draft edits produced by another model call. Submit the final edits via the ' +
-    'submit_edits tool (or, if no tool is available, output ONLY a JSON object of the form ' +
-    '{"edits": [{"search": "...", "replace": "..."}]}). Every search value must be a ' +
-    'character-for-character, unique excerpt from the ORIGINAL REPLY; keep it as short as ' +
-    'possible while remaining unique. Apply only changes required by the REVISION REQUEST, ' +
-    'and do not rewrite any other part of the reply.';
-
-// 修复请求走 ST 原生的 json_schema 通道（而不是自带 tools/tool_choice）：
-// claude 源后端会把它转成强制工具调用（tool_choice {type:'tool', name}），
-// openai/custom 源转成 response_format json_schema——各源都可用。
-// 注意：ST 的 claude 后端把 request.body.tool_choice 当字符串处理，
-// 自带 OpenAI 对象格式的 tool_choice 会被包坏成 {type:{...}} 导致 400。
-const REWRITE_REPAIR_SCHEMA = Object.freeze({
-    name: 'submit_edits',
-    description: 'Submit the final list of search-and-replace edits to apply to the assistant reply.',
-    strict: true,
-    value: {
-        type: 'object',
-        properties: {
-            edits: {
-                type: 'array',
-                items: {
-                    type: 'object',
-                    properties: {
-                        search: {
-                            type: 'string',
-                            description: 'Exact verbatim excerpt from the original reply, as short as possible while unique',
-                        },
-                        replace: { type: 'string' },
-                    },
-                    required: ['search', 'replace'],
-                },
-            },
-        },
-        required: ['edits'],
-    },
-});
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     menuCompress: true,         // 是否在左下角“选项”菜单注入“压缩上下文”
-    menuRewrite: true,          // 是否在左下角“选项”菜单注入“改写上一条”
 
     // —— 压缩 ——
     compressUseMainPreset: false, // 开启时使用主路径的预设、世界书和聊天上下文
@@ -107,29 +50,16 @@ const DEFAULT_SETTINGS = Object.freeze({
     compressIncludePrevSummary: true, // 之前的摘要也发送并合并进新摘要，压缩后一起隐藏
     summaryPrefix: '【压缩摘要】\n',
 
-    // —— 改写上一条 ——
-    rewriteUseMainPreset: true, // 默认保留完整主路径；关闭时仅发送可见聊天和改写指令
-    rewritePreset: '',          // 改写时临时切换到的 Chat Completion 预设；空为跟随当前
-    rewriteDiffMode: true,      // true：模型只输出改动片段（搜索替换块）；false：整条重写
-    rewriteToolRepair: true,    // 局部替换解析/匹配失败时，用独立工具调用修复
-    rewriteStream: true,        // 整条重写时流式输出，边生成边显示在原消息上格式
-    rewritePrompt:
-        'You are revising the latest assistant reply in the conversation above. Apply the ' +
-        'revision request with the minimal necessary changes: keep the wording, style, ' +
-        'formatting and all content not covered by the request unchanged. Write in the same ' +
-        'language as the original reply.',
-
     // —— 模式 ——
     autoMode: true,             // 自动模式开关（关闭即手动模式）
     autoEvery: 10,              // 用户每发送多少条消息自动压缩一次
     autoTrigger: 'tokens',      // count：按用户输入条数；tokens：按历史 token 数
     autoTokens: 12000,          // 上次摘要之后的可见消息 token 数达到此值时自动压缩
 
-    // —— 自定义连接（压缩 / 改写各自独立配置）——
+    // —— 自定义连接 ——
     // 注意：这里的“预设”指 ST 的代理预设（proxies 里带 url / 账号密码的那条），
     // 不是破限或提示词预设。source 为空表示跟随当前连接。
     connCompress: { enabled: true, source: 'openai', proxyPreset: 'api', proxyUrl: '', proxyPassword: '', model: 'deepseek-flash' },
-    connRewrite:  { enabled: false, source: '', proxyPreset: '', proxyUrl: '', proxyPassword: '', model: '' },
 });
 
 // —— 设置读取/初始化 ——
@@ -143,11 +73,12 @@ function getSettings() {
     for (const k of Object.keys(DEFAULT_SETTINGS)) {
         if (!Object.hasOwn(s, k)) s[k] = structuredClone(DEFAULT_SETTINGS[k]);
     }
-    // 清掉旧版缓存断点留下的设置，避免死配置一直躺在 settings.json 里
+    // 清掉旧版缓存断点、以及已移除的「改写」功能留下的设置，避免死配置一直躺在 settings.json 里
     for (const k of LEGACY_SETTING_KEYS) {
         if (Object.hasOwn(s, k)) delete s[k];
     }
-    for (const conn of ['connCompress', 'connRewrite']) {
+    if (Object.hasOwn(s, 'connRewrite')) delete s['connRewrite'];
+    for (const conn of ['connCompress']) {
         if (typeof s[conn] !== 'object' || s[conn] === null) s[conn] = structuredClone(DEFAULT_SETTINGS[conn]);
         for (const k of Object.keys(DEFAULT_SETTINGS[conn])) {
             if (!Object.hasOwn(s[conn], k)) s[conn][k] = DEFAULT_SETTINGS[conn][k];
@@ -191,7 +122,7 @@ function isSummaryMessage(m) {
 //  生成拦截器：注入主路径任务的指令（全局函数，供 manifest 引用）
 // ============================================================
 
-globalThis.compressRewriteInterceptor = async function (chat, _contextSize, _abort, _type) {
+globalThis.compressInterceptor = async function (chat, _contextSize, _abort, _type) {
     try {
         if (!Array.isArray(chat)) return;
 
@@ -199,7 +130,7 @@ globalThis.compressRewriteInterceptor = async function (chat, _contextSize, _abo
         // ST 的 quiet prompt 固定以 system 角色注入在末尾；部分 OpenAI 兼容中转会把
         // system 上提，导致对话以 assistant 结尾，触发“assistant prefill 不支持”400
         // 错误。以 user 消息结尾对任何源都安全。
-        if ((isRewriting || isCompressing) && pendingTaskInjection) {
+        if (isCompressing && pendingTaskInjection) {
             const ctx = SillyTavern.getContext();
             chat.push({
                 name: ctx?.name1 || 'User',
@@ -368,7 +299,7 @@ async function countHistoryTokens() {
 //  压缩执行
 // ============================================================
 async function runCompression(countOverride, { silent = false } = {}) {
-    if (isCompressing || isRewriting) {
+    if (isCompressing) {
         if (!silent) toastr.warning('已有任务在进行中');
         return;
     }
@@ -523,80 +454,6 @@ async function runCompression(countOverride, { silent = false } = {}) {
     toastr.success(doneText);
 }
 
-// ============================================================
-//  改写上一条
-// ============================================================
-const DIFF_BLOCK_RE = /<{4,}\s*SEARCH\s*\r?\n([\s\S]*?)\r?\n={4,}\r?\n([\s\S]*?)\r?\n>{4,}\s*REPLACE/g;
-
-function parseDiffBlocks(text) {
-    return [...String(text ?? '').matchAll(DIFF_BLOCK_RE)]
-        .map((m) => ({ search: m[1], replace: m[2] }));
-}
-
-function normalizeToolEdits(edits) {
-    if (!Array.isArray(edits)) return null;
-    return edits
-        .filter((edit) => edit && typeof edit.search === 'string' && typeof edit.replace === 'string')
-        .map((edit) => ({ search: edit.search, replace: edit.replace }));
-}
-
-function parseToolArguments(value) {
-    if (value && typeof value === 'object') return value;
-    if (typeof value !== 'string') return null;
-    try {
-        return JSON.parse(value);
-    } catch {
-        return null;
-    }
-}
-
-// 同时兼容 Anthropic 原生、OpenAI 兼容以及纯文本兜底响应。
-function extractToolEdits(data) {
-    if (data && Array.isArray(data.content)) {
-        for (const block of data.content) {
-            if (block?.type !== 'tool_use') continue;
-            const input = parseToolArguments(block.input);
-            const edits = normalizeToolEdits(input?.edits);
-            if (edits !== null) return edits;
-        }
-    }
-
-    const toolCalls = data?.choices?.[0]?.message?.tool_calls;
-    if (Array.isArray(toolCalls)) {
-        for (const call of toolCalls) {
-            const args = parseToolArguments(call?.function?.arguments);
-            const edits = normalizeToolEdits(args?.edits);
-            if (edits !== null) return edits;
-        }
-    }
-
-    const textCandidates = [];
-    if (typeof data === 'string') textCandidates.push(data);
-    if (typeof data?.content === 'string') textCandidates.push(data.content);
-    if (typeof data?.choices?.[0]?.message?.content === 'string') {
-        textCandidates.push(data.choices[0].message.content);
-    }
-    if (Array.isArray(data?.content)) {
-        for (const block of data.content) {
-            if (block?.type === 'text' && typeof block.text === 'string') textCandidates.push(block.text);
-        }
-    }
-
-    for (const candidate of textCandidates) {
-        const text = String(candidate).trim();
-        const unfenced = text.match(/^```(?:json)?\s*\n([\s\S]*?)\n?```$/i)?.[1] ?? text;
-        try {
-            const parsed = JSON.parse(unfenced);
-            const edits = normalizeToolEdits(parsed?.edits);
-            if (edits !== null) return edits;
-        } catch { /* 不是纯 JSON，继续尝试文本替换块 */ }
-
-        const blocks = parseDiffBlocks(text);
-        if (blocks.length > 0) return blocks;
-    }
-    return null;
-}
-
 // 当前连接在指定源下使用的模型（未指定自定义连接时的默认模型）
 function currentModelForSource(settings, source) {
     const modelFields = {
@@ -630,19 +487,6 @@ function currentModelForSource(settings, source) {
     };
     const field = modelFields[String(source ?? '').toLowerCase()];
     return (field && settings?.[field]) || settings?.model || '';
-}
-
-function buildRewriteRepairPrompt(original, instruction, draft) {
-    return [
-        REWRITE_TOOL_REPAIR_PROMPT,
-        '--- ORIGINAL REPLY ---',
-        original,
-        '--- REVISION REQUEST ---',
-        instruction,
-        '--- DRAFT EDITS ---',
-        draft,
-        '--- END INPUT ---',
-    ].join('\n\n');
 }
 
 // 独立请求所需的连接参数（源、模型、自定义地址、反代），与主对话当前连接一致
@@ -756,22 +600,6 @@ async function resolveConnection(s, key) {
     };
 }
 
-// 把连接参数覆盖到一个已构造好的请求体上（主路径捕获的请求体或直连构造的请求体）。
-// 返回被清空的字段列表，便于日志排查。
-function applyConnectionOverrides(body, conn) {
-    if (!body || !conn) return;
-    const cleared = [];
-    for (const f of SOURCE_SPECIFIC_FIELDS) {
-        if (body[f] !== undefined) { delete body[f]; cleared.push(f); }
-    }
-    if (conn.source) body.chat_completion_source = conn.source;
-    if (conn.model) body.model = conn.model;
-    body.reverse_proxy = conn.reverseProxy || undefined;
-    body.proxy_password = conn.proxyPassword || undefined;
-    if (!conn.reverseProxy) delete body.reverse_proxy;
-    if (!conn.proxyPassword) delete body.proxy_password;
-    return cleared;
-}
 
 // 直连路径构造连接相关字段（其余采样参数交给预设或当前设置）
 function connectionFields(conn) {
@@ -871,390 +699,6 @@ async function runMainPathTask(ctx, { conn, tag }) {
     });
 }
 
-async function requestRewriteToolRepair(ctx, original, instruction, draft, conn, presetName) {
-    const service = ctx.ChatCompletionService;
-    if (!service || typeof service.processRequest !== 'function') {
-        console.warn(LOG, '当前 SillyTavern 版本未提供 ChatCompletionService，跳过结构化改写修复');
-        return null;
-    }
-
-    const payload = {
-        stream: false,
-        messages: [{
-            role: 'user',
-            content: buildRewriteRepairPrompt(original, instruction, draft),
-        }],
-        max_tokens: 2048,
-        json_schema: structuredClone(REWRITE_REPAIR_SCHEMA),
-        ...connectionFields(conn),
-    };
-
-    try {
-        // 独立自定义请求不经过 generate 拦截器管线，不会改动主对话的请求；
-        // 请求本身只含上面的三段修复材料。
-        // 预设通过 options.presetName 应用，不切换全局选中预设。
-        let data = await service.processRequest(payload, { presetName }, false);
-        if (data && typeof data.json === 'function') data = await data.json();
-        const edits = extractToolEdits(data);
-        if (edits === null) console.warn(LOG, '结构化修复响应中未解析出 edits：', data);
-        return edits;
-    } catch (e) {
-        console.warn(LOG, '结构化改写修复调用失败，退回第一段结果：', e);
-        return null;
-    }
-}
-
-function findLastAssistantIndex(chat) {
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const m = chat[i];
-        if (m && m.is_user === false && m.is_system !== true) return i;
-    }
-    return -1;
-}
-
-// 依次尝试：精确匹配 → 去首尾空白 → 空白容错（连续空白折叠为 \s+）
-function applySearchReplace(text, search, replace) {
-    if (search && text.includes(search)) {
-        return text.replace(search, () => replace);
-    }
-    const trimmed = String(search ?? '').trim();
-    if (!trimmed) return null;
-    if (text.includes(trimmed)) {
-        return text.replace(trimmed, () => replace);
-    }
-    try {
-        const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-        const re = new RegExp(escaped);
-        if (re.test(text)) return text.replace(re, () => replace);
-    } catch { /* 正则构造失败则视为未匹配 */ }
-    return null;
-}
-
-function applyEditBlocks(original, blocks) {
-    let text = original, ok = 0, fail = 0;
-    for (const block of blocks) {
-        const applied = applySearchReplace(text, block.search, block.replace);
-        if (applied === null) fail++;
-        else { text = applied; ok++; }
-    }
-    return { text, ok, fail };
-}
-
-// 整条重写模式下，剥掉模型可能包裹的代码围栏
-function stripCodeFence(text) {
-    const m = text.match(/^```[^\n]*\n([\s\S]*?)\n?```$/);
-    return m ? m[1] : text;
-}
-
-// ST 的 quiet 生成不支持流式。主路径流式改写的做法：照常走 quiet 生成，让 ST 构建完整请求体
-// （预设参数、世界书、拦截器注入的改写指令都已就位），在 CHAT_COMPLETION_SETTINGS_READY
-// 时捕获请求体并调用 stopGeneration()——它同步中止 quiet 请求所用的全局 abortController，
-// 随后的 fetch 以已中止的信号立即失败，不会发出网络请求；再由我们以 stream:true 重发同一请求体。
-// 非 Chat Completion API（没触发该事件）时 body 为 null，直接沿用 quiet 生成的结果。
-async function captureMainPathRequest(ctx) {
-    const { eventSource, event_types } = ctx;
-    const eventName = event_types.CHAT_COMPLETION_SETTINGS_READY;
-    let body = null;
-    const listener = (data) => {
-        if (body || !isRewriting) return;
-        body = JSON.parse(JSON.stringify(data));
-        ctx.stopGeneration();
-    };
-    // 最后执行，确保拿到其他扩展修改后的请求体
-    if (typeof eventSource.makeLast === 'function') eventSource.makeLast(eventName, listener);
-    else eventSource.on(eventName, listener);
-
-    let fallback = '';
-    try {
-        fallback = await ctx.generateQuietPrompt({ quietPrompt: '' });
-    } catch (e) {
-        if (!body) throw e; // 捕获后的中止错误是预期内的
-    } finally {
-        eventSource.removeListener(eventName, listener);
-        // quiet 生成本不会锁 UI（ST 的 is_send_press 只在非 quiet 时置位），
-        // 但 stopGeneration 会触发 GENERATION_STOPPED，为稳妥起见显式兜底解锁一次。
-        try { if (typeof ctx.unblockGeneration === 'function') ctx.unblockGeneration('quiet'); } catch { /* ignore */ }
-    }
-    return { body, fallback };
-}
-
-// 以流式发送请求体，每收到一段就用累计文本回调 onText，返回最终文本
-async function streamChatCompletion(ctx, body, signal, onText) {
-    const generator = await ctx.ChatCompletionService.sendRequest({ ...body, stream: true }, true, signal);
-    let text = '';
-    for await (const chunk of generator()) {
-        if (typeof chunk?.text === 'string') text = chunk.text;
-        onText(text);
-    }
-    return text;
-}
-
-// 流式过程中只刷新消息 DOM，不改 chat 数据；最终结果由调用方写回
-function createStreamRenderer(ctx, idx, msg) {
-    let pending = null, scheduled = false;
-    return (text) => {
-        pending = text;
-        if (scheduled) return;
-        scheduled = true;
-        requestAnimationFrame(() => {
-            scheduled = false;
-            try {
-                const $text = $(`#chat .mes[mesid="${idx}"] .mes_text`);
-                if ($text.length) {
-                    $text.html(ctx.messageFormatting(stripCodeFence(pending), msg.name, false, false, idx));
-                }
-            } catch { /* 渲染失败不影响生成 */ }
-        });
-    };
-}
-
-async function runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction, conn) {
-    const msg = chat[idx];
-    const controller = new AbortController();
-    const render = createStreamRenderer(ctx, idx, msg);
-    const $toast = toastr.info('正在流式改写…（点此停止）', '', {
-        timeOut: 0,
-        extendedTimeOut: 0,
-        tapToDismiss: false,
-        onclick: () => controller.abort(),
-    });
-    let started = false;
-    try {
-        let body;
-        if (s.rewriteUseMainPreset) {
-            pendingTaskInjection = rewriteInstruction;
-            const captured = await captureMainPathRequest(ctx);
-            pendingTaskInjection = null;
-            if (!captured.body) return String(captured.fallback ?? '');
-            body = captured.body;
-            // 自定义连接只覆盖请求体里的连接字段，其余（预设参数、世界书）原样保留
-            applyConnectionOverrides(body, conn);
-        } else {
-            const settings = ctx.chatCompletionSettings || {};
-            const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
-                role: m.is_user ? 'user' : 'assistant',
-                content: String(m.mes ?? ''),
-            }));
-            messages.push({ role: 'user', content: rewriteInstruction });
-            body = {
-                ...connectionFields(conn),
-                ...apiUrlFieldsForSource(settings, conn?.source),
-                messages,
-                max_tokens: settings.openai_max_tokens,
-                temperature: Number(settings.temp_openai),
-                custom_prompt_post_processing: settings.custom_prompt_post_processing,
-            };
-        }
-        started = true;
-        return await streamChatCompletion(ctx, body, controller.signal, render);
-    } catch (e) {
-        if (controller.signal.aborted) {
-            const err = new Error('stopped');
-            err.stoppedByUser = true;
-            throw err;
-        }
-        throw e;
-    } finally {
-        toastr.clear($toast);
-        // 流式期间 DOM 显示的是半成品，失败/停止时恢复原文；成功时调用方会再次刷新
-        if (started) {
-            try { ctx.updateMessageBlock(idx, msg); } catch { /* ignore */ }
-        }
-    }
-}
-
-async function runRewrite(instruction) {
-    if (isRewriting || isCompressing) {
-        toastr.warning('已有任务在进行中');
-        return false;
-    }
-    instruction = String(instruction ?? '').trim();
-    if (!instruction) {
-        toastr.warning('请先在输入框写下改写要求，再点「改写上一条」');
-        return false;
-    }
-    const ctx = SillyTavern.getContext();
-    const s = getSettings();
-    const chat = ctx.chat;
-    if (!Array.isArray(chat) || chat.length === 0) {
-        toastr.warning('当前没有聊天记录');
-        return false;
-    }
-    const idx = findLastAssistantIndex(chat);
-    if (idx < 0) {
-        toastr.warning('没有可改写的 AI 消息');
-        return false;
-    }
-    const msg = chat[idx];
-    const original = String(msg.mes ?? '');
-
-    const rewriteInstruction = [
-        s.rewritePrompt,
-        `Revision request: ${instruction}`,
-        s.rewriteDiffMode ? REWRITE_FORMAT_DIFF : REWRITE_FORMAT_FULL,
-    ].join('\n\n');
-
-    let result = '';
-    const conn = await resolveConnection(s, 'connRewrite');
-    if (conn) warnConnection(conn, '改写');
-    // 整条重写 + 流式：不显示遮罩，让生成过程直接显示在原消息上
-    const streaming = !s.rewriteDiffMode && s.rewriteStream && ctx.mainApi === 'openai'
-        && typeof ctx.ChatCompletionService?.sendRequest === 'function'
-        && typeof ctx.stopGeneration === 'function';
-    const loaderHandle = (!streaming && ctx.loader) ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
-    isRewriting = true;
-    try {
-        result = await withPreset(s.rewritePreset, async () => {
-            if (streaming) {
-                return await runRewriteStreaming(ctx, s, chat, idx, rewriteInstruction, conn);
-            }
-            // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史）。改写指令不经 quiet prompt
-            // （那会以 system 角色注入末尾，OpenAI 兼容源上提 system 后以 assistant 结尾、
-            // 触发 prefill 400），而是由拦截器以追加 user 消息注入，保证对话以 user 结尾。
-            if (s.rewriteUseMainPreset) {
-                pendingTaskInjection = rewriteInstruction;
-                return await runMainPathTask(ctx, { conn, tag: '改写' });
-            }
-            // 直连路径：未隐藏的聊天内容 + 改写指令
-            const messages = chat.filter(m => m && m.is_system !== true).map(m => ({
-                role: m.is_user ? 'user' : 'assistant',
-                content: String(m.mes ?? ''),
-            }));
-            messages.push({ role: 'user', content: rewriteInstruction });
-            return await runDirectTask(ctx, {
-                conn,
-                presetName: s.rewritePreset,
-                userPrompt: '',
-                messages,
-            }, '改写');
-        });
-    } catch (e) {
-        if (e?.stoppedByUser) {
-            toastr.info('已停止改写，原文未改动');
-            return false;
-        }
-        console.error(LOG, '改写生成失败：', e);
-        toastr.error('改写生成失败，详见控制台');
-        return false;
-    } finally {
-        try {
-            if (loaderHandle) await loaderHandle.hide();
-        } finally {
-            isRewriting = false;
-            pendingTaskInjection = null;
-        }
-    }
-
-    result = String(result ?? '').trim();
-    if (!result) {
-        toastr.error('改写失败：模型返回为空');
-        return false;
-    }
-
-    let newText;
-    let repaired = false;
-    if (s.rewriteDiffMode) {
-        const blocks = parseDiffBlocks(result);
-        const firstPass = applyEditBlocks(original, blocks);
-        let finalPass = firstPass;
-
-        // 第一段只要有一个块解析/匹配失败，便从原文重新应用工具修复的完整 edits；
-        // 全部成功时不发第二段请求，以节省 token 和延迟。
-        if (s.rewriteToolRepair && (blocks.length === 0 || firstPass.fail > 0)) {
-            const repairLoader = ctx.loader ? ctx.loader.show({ message: '正在结构化修复改写结果…' }) : null;
-            isRewriting = true;
-            try {
-                const edits = await requestRewriteToolRepair(ctx, original, instruction, result, conn, s.rewritePreset);
-                if (edits !== null) {
-                    const repairPass = applyEditBlocks(original, edits);
-                    // 修复结果反而全部失配时，保留第一段的部分成果
-                    if (repairPass.ok > 0 || firstPass.ok === 0) {
-                        finalPass = repairPass;
-                        repaired = true;
-                    } else {
-                        console.warn(LOG, '结构化修复的 edits 全部失配，沿用第一段结果');
-                    }
-                }
-            } finally {
-                try {
-                    if (repairLoader) await repairLoader.hide();
-                } finally {
-                    isRewriting = false;
-                }
-            }
-        }
-
-        if (!repaired && blocks.length === 0) {
-            console.warn(LOG, '未解析出替换块，模型原始输出：', result);
-            toastr.error('改写失败：未能从模型输出中解析出替换块（原文未改动，详见控制台）');
-            return false;
-        }
-        if (finalPass.ok === 0) {
-            toastr.error('改写失败：所有替换块都与原文不匹配（原文未改动）');
-            return false;
-        }
-        if (finalPass.fail > 0) {
-            toastr.warning(`有 ${finalPass.fail} 个替换块未匹配到原文，已应用其余 ${finalPass.ok} 个`);
-        }
-        newText = finalPass.text;
-    } else {
-        newText = stripCodeFence(result);
-    }
-
-    if (newText === original) {
-        toastr.info('改写结果与原文相同，未做修改');
-        return false;
-    }
-
-    // 原文备份为 swipe，可左滑找回
-    if (!Array.isArray(msg.swipes) || msg.swipes.length === 0) {
-        msg.swipes = [original];
-        msg.swipe_id = 0;
-    }
-    if (!Number.isInteger(msg.swipe_id) || msg.swipe_id < 0 || msg.swipe_id >= msg.swipes.length) {
-        msg.swipe_id = msg.swipes.length - 1;
-    }
-    if (!Array.isArray(msg.swipe_info) || msg.swipe_info.length !== msg.swipes.length) {
-        msg.swipe_info = msg.swipes.map(() => ({
-            send_date: msg.send_date,
-            gen_started: msg.gen_started,
-            gen_finished: msg.gen_finished,
-            extra: structuredClone(msg.extra ?? {}),
-        }));
-    }
-    msg.swipes.push(newText);
-    msg.swipe_info.push({
-        send_date: ctx.getMessageTimeStamp ? ctx.getMessageTimeStamp() : new Date().toISOString(),
-        gen_started: msg.gen_started,
-        gen_finished: msg.gen_finished,
-        extra: structuredClone(msg.extra ?? {}),
-    });
-    msg.swipe_id = msg.swipes.length - 1;
-    msg.mes = newText;
-
-    try {
-        if (typeof ctx.updateMessageBlock === 'function') {
-            ctx.updateMessageBlock(idx, msg);
-        } else if (ctx.reloadCurrentChat) {
-            await ctx.reloadCurrentChat();
-        }
-    } catch (e) {
-        console.warn(LOG, '刷新消息渲染失败：', e);
-    }
-    try {
-        await ctx.eventSource.emit(ctx.event_types.MESSAGE_UPDATED, idx);
-    } catch { /* 事件通知失败不影响主流程 */ }
-    try {
-        if (ctx.saveChat) await ctx.saveChat();
-    } catch (e) {
-        console.warn(LOG, 'saveChat 失败：', e);
-    }
-
-    toastr.success(s.rewriteDiffMode
-        ? `改写完成${repaired ? '（经工具修复）' : ''}（原文已存为 swipe，可左滑找回）`
-        : '已整条重写（原文已存为 swipe）');
-    return true;
-}
 
 // ============================================================
 //  自动模式：事件监听
@@ -1267,12 +711,12 @@ function onChatMutated() {
 function onGenerationEnded() {
     try {
         const s = getSettings();
-        if (!s.enabled || !s.autoMode || isCompressing || isRewriting) return;
+        if (!s.enabled || !s.autoMode || isCompressing) return;
         if (s.autoTrigger === 'tokens') {
             // 回复已落库后再计数
             setTimeout(async () => {
                 try {
-                    if (isCompressing || isRewriting) return;
+                    if (isCompressing) return;
                     const tokens = await countHistoryTokens();
                     refreshCounterDisplay(tokens);
                     const limit = Math.max(1, Number(s.autoTokens) || 20000);
@@ -1327,7 +771,6 @@ function insertMenuItem(html, preferAnchor) {
 function syncMenuButtons() {
     const s = getSettings();
     const wantCompress = !!(s.enabled && s.menuCompress);
-    const wantRewrite = !!(s.enabled && s.menuRewrite);
 
     if (wantCompress && !$('#option_compress_context').length) {
         insertMenuItem(`
@@ -1339,15 +782,6 @@ function syncMenuButtons() {
         $('#option_compress_context').remove();
     }
 
-    if (wantRewrite && !$('#option_rewrite_last').length) {
-        insertMenuItem(`
-        <a id="option_rewrite_last" class="interactable" tabindex="0">
-            <i class="fa-lg fa-solid fa-pen-nib"></i>
-            <span>改写上一条</span>
-        </a>`, '#option_compress_context');
-    } else if (!wantRewrite) {
-        $('#option_rewrite_last').remove();
-    }
 }
 
 // 委托事件只绑定一次，按钮移除/重建都无需重绑
@@ -1355,13 +789,6 @@ function bindMenuHandlers() {
     $(document).on('click', '#option_compress_context', async function () {
         try { $('#options').hide(); } catch { /* ignore */ }
         await runCompression();
-    });
-    $(document).on('click', '#option_rewrite_last', async function () {
-        try { $('#options').hide(); } catch { /* ignore */ }
-        const $ta = $('#send_textarea');
-        const ok = await runRewrite(String($ta.val() ?? ''));
-        // 成功后清空输入框（触发 input 让 ST 刷新 token 计数等）；失败保留指令便于重试
-        if (ok) $ta.val('').trigger('input');
     });
 }
 
@@ -1497,7 +924,7 @@ function refreshModelOptions(taskId, conn) {
     $model.val(conn.model || '');
 }
 
-// 生成一块「自定义连接」设置区。taskId 用于区分压缩 / 改写的 DOM id 与设置键。
+// 生成一块「自定义连接」设置区。taskId 用于区分任务的 DOM id 与设置键。
 function buildConnectionHtml(taskId, title, note) {
     const id = `cc_conn_${taskId}`;
     const options = CC_SOURCES
@@ -1544,7 +971,7 @@ function buildSettingsHtml() {
     <div class="compress-cache-settings">
       <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-          <b>压缩与改写</b>
+          <b>压缩</b>
           <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -1556,10 +983,6 @@ function buildSettingsHtml() {
           <label class="checkbox_label" for="cc_menu_compress">
             <input id="cc_menu_compress" type="checkbox" />
             <span>在左下角菜单显示「压缩上下文」</span>
-          </label>
-          <label class="checkbox_label" for="cc_menu_rewrite">
-            <input id="cc_menu_rewrite" type="checkbox" />
-            <span>在左下角菜单显示「改写上一条」</span>
           </label>
           <small class="notes">关闭扩展或对应开关时，不会向左下角菜单注入按钮。</small>
 
@@ -1649,39 +1072,6 @@ ${buildConnectionHtml('compress', '压缩连接（源 / 代理预设 / 模型）
             <span>压缩后隐藏原始消息（移出上下文）</span>
           </label>
 
-          <hr>
-          <h4>改写上一条</h4>
-
-          <label class="checkbox_label" for="cc_rw_main_preset">
-            <input id="cc_rw_main_preset" type="checkbox" />
-            <span>使用主路径预设</span>
-          </label>
-          <small class="notes">开启后带上当前主对话的预设、世界书和上下文；关闭时仅发送未隐藏的聊天内容和改写指令。默认开启。</small>
-
-          <label for="cc_rw_preset">改写用预设</label>
-          <select id="cc_rw_preset" class="text_pole cc_preset_select"></select>
-          <small class="notes">改写时临时切换到此预设，完成后切回。<br>注意：切换预设会重新载入预设文件，当前预设未保存的改动会丢失，请先保存。</small>
-${buildConnectionHtml('rewrite', '改写连接（源 / 代理预设 / 模型）',
-        '开启后改写请求会走这里指定的源、代理和模型；结构修复请求也一并跟随。开了「使用主路径预设」时提示词仍由主路径构建，只替换连接。')}
-
-          <label class="checkbox_label" for="cc_rw_diff">
-            <input id="cc_rw_diff" type="checkbox" />
-            <span>局部替换模式（模型只输出改动片段，省 token、不动其余部分；关闭则整条重写）</span>
-          </label>
-
-          <label class="checkbox_label" for="cc_rw_repair">
-            <input id="cc_rw_repair" type="checkbox" />
-            <span>解析失败时用独立工具调用修复（不改动主对话）</span>
-          </label>
-
-          <label class="checkbox_label" for="cc_rw_stream">
-            <input id="cc_rw_stream" type="checkbox" />
-            <span>整条重写时流式输出（边生成边显示在原消息上，点提示可停止）</span>
-          </label>
-
-          <label for="cc_rw_prompt">改写提示词</label>
-          <textarea id="cc_rw_prompt" class="text_pole textarea_compact" rows="4"></textarea>
-          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。</small>
 
         </div>
       </div>
@@ -1700,8 +1090,8 @@ async function refreshPresetOptions(force = false) {
 
     const proxies = await loadProxyPresets(force);
     const key = JSON.stringify([
-        names, s.compressPreset, s.rewritePreset,
-        s.connCompress, s.connRewrite,
+        names, s.compressPreset,
+        s.connCompress,
         proxies.map(p => p?.name),
     ]);
     if (key === lastPresetNamesKey) return;
@@ -1716,13 +1106,11 @@ async function refreshPresetOptions(force = false) {
         $sel.val(selected || '');
     };
     fill('#cc_compress_preset', s.compressPreset);
-    fill('#cc_rw_preset', s.rewritePreset);
     await refreshConnectionUI(s);
 }
 
 const CC_CONN_TASKS = Object.freeze([
     ['compress', 'connCompress'],
-    ['rewrite', 'connRewrite'],
 ]);
 
 // 刷新「自定义连接」区域的三个下拉与显隐
@@ -1764,7 +1152,6 @@ async function refreshUI() {
     }
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_menu_compress').prop('checked', s.menuCompress);
-    $('#cc_menu_rewrite').prop('checked', s.menuRewrite);
     $('#cc_auto').prop('checked', s.autoMode);
     $('#cc_auto_every').val(s.autoEvery);
     $('#cc_compress_main_preset').prop('checked', s.compressUseMainPreset);
@@ -1777,11 +1164,6 @@ async function refreshUI() {
     $('#cc_include_prev_summary').prop('checked', s.compressIncludePrevSummary);
     $('#cc_auto_trigger').val(s.autoTrigger);
     $('#cc_auto_tokens').val(s.autoTokens);
-    $('#cc_rw_main_preset').prop('checked', s.rewriteUseMainPreset);
-    $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
-    $('#cc_rw_repair').prop('checked', s.rewriteToolRepair);
-    $('#cc_rw_stream').prop('checked', s.rewriteStream);
-    $('#cc_rw_prompt').val(s.rewritePrompt);
     refreshCounterDisplay();
 }
 
@@ -1790,12 +1172,10 @@ function bindUI() {
 
     $('#cc_enabled').on('change', function () { s.enabled = $(this).prop('checked'); save(); syncMenuButtons(); });
     $('#cc_menu_compress').on('change', function () { s.menuCompress = $(this).prop('checked'); save(); syncMenuButtons(); });
-    $('#cc_menu_rewrite').on('change', function () { s.menuRewrite = $(this).prop('checked'); save(); syncMenuButtons(); });
     $('#cc_auto').on('change', function () { s.autoMode = $(this).prop('checked'); save(); refreshCounterDisplay(); });
     $('#cc_auto_every').on('input', function () { s.autoEvery = Math.max(1, parseInt($(this).val()) || 10); save(); refreshCounterDisplay(); });
     $('#cc_compress_main_preset').on('change', function () { s.compressUseMainPreset = $(this).prop('checked'); save(); });
     $('#cc_compress_preset').on('change', function () { s.compressPreset = String($(this).val() ?? ''); save(); });
-    $('#cc_rw_preset').on('change', function () { s.rewritePreset = String($(this).val() ?? ''); save(); });
     // 展开下拉前刷新列表，跟上预设的新增/改名/删除
     // （同时会刷新代理预设下拉与模型候选）
     $('.cc_preset_select').on('mousedown focus', () => refreshPresetOptions(true));
@@ -1829,11 +1209,6 @@ function bindUI() {
     $('#cc_auto_trigger').on('change', function () { s.autoTrigger = String($(this).val()); save(); refreshCounterDisplay(); });
     $('#cc_auto_tokens').on('input', function () { s.autoTokens = Math.max(1, parseInt($(this).val()) || 20000); save(); refreshCounterDisplay(); });
     $('#cc_keep_last').on('input', function () { s.compressKeepLast = Math.max(0, parseInt($(this).val()) || 0); save(); });
-    $('#cc_rw_main_preset').on('change', function () { s.rewriteUseMainPreset = $(this).prop('checked'); save(); });
-    $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
-    $('#cc_rw_repair').on('change', function () { s.rewriteToolRepair = $(this).prop('checked'); save(); });
-    $('#cc_rw_stream').on('change', function () { s.rewriteStream = $(this).prop('checked'); save(); });
-    $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
 
     $('#cc_run').on('click', async function () {
         const n = parseInt($('#cc_run_input').val());
@@ -1862,21 +1237,6 @@ function registerSlashCommand() {
                     description: '可选：只压缩最近 N 条消息',
                     typeList: ARGUMENT_TYPE ? [ARGUMENT_TYPE.NUMBER] : undefined,
                     isRequired: false,
-                }),
-            ] : [],
-        }));
-        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-            name: 'rewrite',
-            helpString: '按指令局部改写最后一条 AI 回复（原文存为 swipe）。用法：/rewrite 把结尾改含蓄一点',
-            callback: async (_named, unnamed) => {
-                await runRewrite(String(unnamed ?? ''));
-                return '';
-            },
-            unnamedArgumentList: SlashCommandArgument ? [
-                SlashCommandArgument.fromProps({
-                    description: '改写要求',
-                    typeList: ARGUMENT_TYPE ? [ARGUMENT_TYPE.STRING] : undefined,
-                    isRequired: true,
                 }),
             ] : [],
         }));
