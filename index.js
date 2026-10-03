@@ -104,6 +104,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
     compressKeepLast: 4,        // 摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏
     compressIncludeKept: false, // 保留的 N 条是否也发送给模型并一起总结
+    compressIncludePrevSummary: true, // 之前的摘要也发送并合并进新摘要，压缩后一起隐藏
     summaryPrefix: '【压缩摘要】\n',
 
     // —— 改写上一条 ——
@@ -255,8 +256,9 @@ async function withPreset(presetName, fn) {
 // countOverride 为数字时：targets 取 kept 之前最近 N 条可压缩消息。
 // 否则：targets 取“上一次压缩摘要之后”到 kept 之前的全部可压缩消息。
 // 主路径压缩时告诉模型总结范围（聊天本身已在请求中）
-function buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride) {
+function buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride, prevSummaries = []) {
     const hasSummary = findLastSummaryIndex(chat) >= 0;
+    const mergePrev = prevSummaries.length > 0;
     const partial = Number.isFinite(countOverride) && countOverride > 0;
     let scope;
     const excludeKept = !includeKept && kept.length > 0;
@@ -264,6 +266,8 @@ function buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride)
         scope = excludeKept
             ? `Summarize ONLY the ${targets.length} message(s) that come right before the final ${kept.length} message(s) of the conversation above.`
             : `Summarize ONLY the last ${targets.length + kept.length} message(s) of the conversation above.`;
+    } else if (hasSummary && mergePrev) {
+        scope = 'Summarize the most recent memory summary together with the part of the conversation above that comes after it.';
     } else if (hasSummary) {
         scope = 'Summarize ONLY the part of the conversation above that comes after the most recent memory summary. Treat earlier summaries as background, do not repeat them.';
     } else {
@@ -271,6 +275,10 @@ function buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride)
     }
     if (excludeKept && !partial) {
         scope += ` Do NOT include the final ${kept.length} message(s); they will be kept verbatim.`;
+    }
+    if (mergePrev) {
+        scope += ` The previous memory summary message(s) (${prevSummaries.length}) will be replaced by your output, ` +
+            'so merge their content into ONE consolidated summary covering everything, in chronological order.';
     }
     return scope + ' Output only the summary.';
 }
@@ -305,6 +313,28 @@ function collectTargets(countOverride, keepLast = 0) {
         if (eligible(chat[i])) targets.push(i);
     }
     return { targets, kept };
+}
+
+// 与本次压缩范围相邻的“之前的摘要”（可见的）：
+//   - 从 targets 第一条往前回溯，跳过已隐藏消息，收集连续的可见摘要，遇到可见普通消息即停止
+//     （中间隔着未压缩的可见消息时不合并，避免新摘要覆盖的时间顺序错乱）；
+//   - 以及夹在 targets 中间的可见摘要（指定条数压缩时可能出现）。
+function collectPrevSummaries(chat, targets) {
+    if (!Array.isArray(chat) || targets.length === 0) return [];
+    const first = targets[0], last = targets[targets.length - 1];
+    const out = [];
+    for (let i = first - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (!m || m.is_system === true) continue;
+        if (isSummaryMessage(m)) { out.push(i); continue; }
+        break;
+    }
+    out.reverse();
+    for (let i = first + 1; i < last; i++) {
+        const m = chat[i];
+        if (m && m.is_system !== true && isSummaryMessage(m)) out.push(i);
+    }
+    return out;
 }
 
 function findLastSummaryIndex(chat) {
@@ -350,7 +380,6 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const { targets, kept } = collectTargets(countOverride, keepLast);
     // 总结范围与插入位置解耦：保留的 N 条可见消息也可一起总结
     const includeKept = s.compressIncludeKept && kept.length > 0;
-    const summarized = includeKept ? [...targets, ...kept] : targets;
     if (targets.length === 0) {
         if (!silent) {
             toastr.warning(keepLast > 0
@@ -360,8 +389,15 @@ async function runCompression(countOverride, { silent = false } = {}) {
         return;
     }
 
+    const prevSummaries = s.compressIncludePrevSummary ? collectPrevSummaries(chat, targets) : [];
+    const byIndex = (a, b) => a - b;
+    const summarized = [...prevSummaries, ...targets, ...(includeKept ? kept : [])].sort(byIndex);
+    // 需要隐藏的消息：被压缩的消息 + 合并进来的旧摘要（保留的 N 条始终可见）
+    const toHide = [...prevSummaries, ...targets].sort(byIndex);
+
     const transcript = summarized.map((i) => {
         const m = chat[i];
+        if (isSummaryMessage(m)) return `[Earlier memory summary]\n${m.mes ?? ''}`;
         const who = m.is_user ? (ctx.name1 || 'User') : (m.name || ctx.name2 || 'Character');
         return `${who}: ${m.mes ?? ''}`;
     }).join('\n\n');
@@ -377,7 +413,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
                 // 主路径：聊天原样随请求发送，不再单独提取文字稿；只在末尾追加一条 user 指令
                 pendingTaskInjection = [
                     s.compressPrompt,
-                    buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride),
+                    buildMainPathScopeNote(chat, targets, kept, includeKept, countOverride, prevSummaries),
                 ].join('\n\n');
                 return await runMainPathTask(ctx, { conn, tag: '压缩' });
             }
@@ -423,8 +459,8 @@ async function runCompression(countOverride, { silent = false } = {}) {
     if (s.hideOriginals) {
         // 按连续区间分组隐藏，避免 min-max 整段误伤夹在中间的非目标消息（如上一条摘要）
         const runs = [];
-        let runStart = targets[0], prev = targets[0];
-        for (const i of targets.slice(1)) {
+        let runStart = toHide[0], prev = toHide[0];
+        for (const i of toHide.slice(1)) {
             if (i === prev + 1) { prev = i; continue; }
             runs.push([runStart, prev]);
             runStart = prev = i;
@@ -443,7 +479,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
             console.warn(LOG, '/hide 调用失败，退回手动隐藏：', e);
         }
         if (!hid) {
-            for (const i of targets) chat[i].is_system = true;
+            for (const i of toHide) chat[i].is_system = true;
             needReload = true;
         }
     }
@@ -479,9 +515,12 @@ async function runCompression(countOverride, { silent = false } = {}) {
 
     refreshCounterDisplay();
 
-    toastr.success(includeKept
-        ? `已压缩 ${summarized.length} 条消息（其中最近 ${kept.length} 条保留可见）`
-        : `已压缩 ${targets.length} 条消息`);
+    const msgCount = targets.length + (includeKept ? kept.length : 0);
+    let doneText = includeKept
+        ? `已压缩 ${msgCount} 条消息（其中最近 ${kept.length} 条保留可见）`
+        : `已压缩 ${msgCount} 条消息`;
+    if (prevSummaries.length > 0) doneText += `，并合并了 ${prevSummaries.length} 条旧摘要`;
+    toastr.success(doneText);
 }
 
 // ============================================================
@@ -1566,6 +1605,11 @@ function buildSettingsHtml() {
             <input id="cc_include_kept" type="checkbox" />
             <span>保留的消息也发送并一起总结</span>
           </label>
+          <label class="checkbox_label" for="cc_include_prev_summary">
+            <input id="cc_include_prev_summary" type="checkbox" />
+            <span>之前的摘要也发送并合并</span>
+          </label>
+          <small class="notes">勾选时，紧挨本次压缩范围的上一条摘要也会发给模型，合并成一条新摘要；开启“隐藏原始消息”时旧摘要会一起隐藏。默认勾选。</small>
           <small class="notes">摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏。勾选时这 N 条也会发给模型并写进摘要，只影响插入位置；不勾选时它们不参与本次总结。0 表示不保留。这个设置不影响自动触发。</small>
 
           <hr>
@@ -1730,6 +1774,7 @@ async function refreshUI() {
     $('#cc_hide').prop('checked', s.hideOriginals);
     $('#cc_keep_last').val(s.compressKeepLast);
     $('#cc_include_kept').prop('checked', s.compressIncludeKept);
+    $('#cc_include_prev_summary').prop('checked', s.compressIncludePrevSummary);
     $('#cc_auto_trigger').val(s.autoTrigger);
     $('#cc_auto_tokens').val(s.autoTokens);
     $('#cc_rw_main_preset').prop('checked', s.rewriteUseMainPreset);
@@ -1780,6 +1825,7 @@ function bindUI() {
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
     $('#cc_include_kept').on('change', function () { s.compressIncludeKept = $(this).prop('checked'); save(); });
+    $('#cc_include_prev_summary').on('change', function () { s.compressIncludePrevSummary = $(this).prop('checked'); save(); });
     $('#cc_auto_trigger').on('change', function () { s.autoTrigger = String($(this).val()); save(); refreshCounterDisplay(); });
     $('#cc_auto_tokens').on('input', function () { s.autoTokens = Math.max(1, parseInt($(this).val()) || 20000); save(); refreshCounterDisplay(); });
     $('#cc_keep_last').on('input', function () { s.compressKeepLast = Math.max(0, parseInt($(this).val()) || 0); save(); });
