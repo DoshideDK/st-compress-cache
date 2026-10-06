@@ -22,6 +22,7 @@ const LEGACY_SETTING_KEYS = Object.freeze([
     'bpCompression', 'bpLastAssistant', 'bpInput',
     'menuRewrite', 'rewriteUseMainPreset', 'rewritePreset', 'rewriteDiffMode',
     'rewriteToolRepair', 'rewriteStream', 'rewritePrompt',
+    'compressKeepLast',   // 已拆分为 compressKeepLastManual / compressKeepLastAuto
 ]);
 
 let isCompressing = false;
@@ -45,7 +46,8 @@ const DEFAULT_SETTINGS = Object.freeze({
         'preamble and no explanations.',
     compressRole: 'assistant',  // 摘要写回时的角色：assistant / user
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
-    compressKeepLast: 4,        // 摘要插在倒数第 N 条之前，这 N 条保持可见、不隐藏
+    compressKeepLastManual: 2,  // 手动压缩（立即压缩按钮 / 选项菜单 / 斜杠命令）保留最近 N 条不压缩
+    compressKeepLastAuto: 4,    // 自动压缩保留最近 N 条不压缩（摘要插在这 N 条之前，它们保持可见）
     compressIncludeKept: false, // 保留的 N 条是否也发送给模型并一起总结
     compressIncludePrevSummary: true, // 之前的摘要也发送并合并进新摘要，压缩后一起隐藏
     summaryPrefix: '【压缩摘要】\n',
@@ -298,7 +300,7 @@ async function countHistoryTokens() {
 // ============================================================
 //  压缩执行
 // ============================================================
-async function runCompression(countOverride, { silent = false } = {}) {
+async function runCompression(countOverride, { silent = false, auto = false } = {}) {
     if (isCompressing) {
         if (!silent) toastr.warning('已有任务在进行中');
         return;
@@ -307,7 +309,7 @@ async function runCompression(countOverride, { silent = false } = {}) {
     const s = getSettings();
     const chat = ctx.chat;
 
-    const keepLast = Math.max(0, Math.floor(Number(s.compressKeepLast) || 0));
+    const keepLast = Math.max(0, Math.floor(Number(auto ? s.compressKeepLastAuto : s.compressKeepLastManual) || 0));
     const { targets, kept } = collectTargets(countOverride, keepLast);
     // 总结范围与插入位置解耦：保留的 N 条可见消息也可一起总结
     const includeKept = s.compressIncludeKept && kept.length > 0;
@@ -720,7 +722,7 @@ function onGenerationEnded() {
                     const tokens = await countHistoryTokens();
                     refreshCounterDisplay(tokens);
                     const limit = Math.max(1, Number(s.autoTokens) || 20000);
-                    if (tokens >= limit) await runCompression(undefined, { silent: true });
+                    if (tokens >= limit) await runCompression(undefined, { silent: true, auto: true });
                 } catch (e) {
                     console.warn(LOG, '按 token 自动压缩出错：', e);
                 }
@@ -730,7 +732,7 @@ function onGenerationEnded() {
         const every = Math.max(1, Number(s.autoEvery) || 10);
         if (countUserTurns() >= every) {
             // 回复已落库，此刻后台压缩安全
-            setTimeout(() => runCompression(undefined, { silent: true }), 500);
+            setTimeout(() => runCompression(undefined, { silent: true, auto: true }), 500);
         }
     } catch (e) {
         console.warn(LOG, 'onGenerationEnded 出错：', e);
@@ -1020,10 +1022,16 @@ function buildSettingsHtml() {
           <small class="notes">“立即压缩”默认压缩上次压缩点之后的全部消息；填了条数则只压缩最近 N 条。输入框旁的“选项”菜单（重新生成/AI帮答/续写）里也有同款按钮。</small>
 
           <div class="flex-container" style="margin-top:8px; align-items:center; gap:6px;">
-            <span>保留最近</span>
-            <input id="cc_keep_last" type="number" min="0" step="1" class="text_pole" style="max-width:80px;" />
+            <span>手动压缩保留最近</span>
+            <input id="cc_keep_last_manual" type="number" min="0" step="1" class="text_pole" style="max-width:80px;" />
             <span>条不压缩</span>
           </div>
+          <div class="flex-container" style="margin-top:4px; align-items:center; gap:6px;">
+            <span>自动压缩保留最近</span>
+            <input id="cc_keep_last_auto" type="number" min="0" step="1" class="text_pole" style="max-width:80px;" />
+            <span>条不压缩</span>
+          </div>
+          <small class="notes">手动 = 立即压缩按钮、选项菜单里的“压缩上下文”、/compress 命令；自动 = 自动模式触发的压缩。</small>
           <label class="checkbox_label" for="cc_include_kept">
             <input id="cc_include_kept" type="checkbox" />
             <span>保留的消息也发送并一起总结</span>
@@ -1159,7 +1167,8 @@ async function refreshUI() {
     $('#cc_role').val(s.compressRole);
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
-    $('#cc_keep_last').val(s.compressKeepLast);
+    $('#cc_keep_last_manual').val(s.compressKeepLastManual);
+    $('#cc_keep_last_auto').val(s.compressKeepLastAuto);
     $('#cc_include_kept').prop('checked', s.compressIncludeKept);
     $('#cc_include_prev_summary').prop('checked', s.compressIncludePrevSummary);
     $('#cc_auto_trigger').val(s.autoTrigger);
@@ -1208,7 +1217,8 @@ function bindUI() {
     $('#cc_include_prev_summary').on('change', function () { s.compressIncludePrevSummary = $(this).prop('checked'); save(); });
     $('#cc_auto_trigger').on('change', function () { s.autoTrigger = String($(this).val()); save(); refreshCounterDisplay(); });
     $('#cc_auto_tokens').on('input', function () { s.autoTokens = Math.max(1, parseInt($(this).val()) || 20000); save(); refreshCounterDisplay(); });
-    $('#cc_keep_last').on('input', function () { s.compressKeepLast = Math.max(0, parseInt($(this).val()) || 0); save(); });
+    $('#cc_keep_last_manual').on('input', function () { s.compressKeepLastManual = Math.max(0, parseInt($(this).val()) || 0); save(); });
+    $('#cc_keep_last_auto').on('input', function () { s.compressKeepLastAuto = Math.max(0, parseInt($(this).val()) || 0); save(); });
 
     $('#cc_run').on('click', async function () {
         const n = parseInt($('#cc_run_input').val());
