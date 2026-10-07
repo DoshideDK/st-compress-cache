@@ -61,8 +61,15 @@ const DEFAULT_SETTINGS = Object.freeze({
     // —— 自定义连接 ——
     // 注意：这里的“预设”指 ST 的代理预设（proxies 里带 url / 账号密码的那条），
     // 不是破限或提示词预设。source 为空表示跟随当前连接。
-    connCompress: { enabled: true, source: 'openai', proxyPreset: 'api', proxyUrl: '', proxyPassword: '', model: 'deepseek-flash' },
+    connCompress: { enabled: true, source: 'openai', proxyPreset: 'api', model: 'deepseek-flash' },
+
+    // —— 自动压缩规则 ——
+    // 只有主对话当前连接同时满足三条时才允许自动压缩（手动压缩不受影响）。
+    // 'all' 表示不限制。source / proxyPreset 精确匹配；model 宽松匹配（名称包含即可，忽略大小写）。
+    autoRule: { source: 'claude', proxyPreset: 'all', model: 'claude' },
 });
+
+const RULE_ALL = 'all';
 
 // —— 设置读取/初始化 ——
 function getSettings() {
@@ -80,11 +87,15 @@ function getSettings() {
         if (Object.hasOwn(s, k)) delete s[k];
     }
     if (Object.hasOwn(s, 'connRewrite')) delete s['connRewrite'];
-    for (const conn of ['connCompress']) {
+    for (const conn of ['connCompress', 'autoRule']) {
         if (typeof s[conn] !== 'object' || s[conn] === null) s[conn] = structuredClone(DEFAULT_SETTINGS[conn]);
         for (const k of Object.keys(DEFAULT_SETTINGS[conn])) {
             if (!Object.hasOwn(s[conn], k)) s[conn][k] = DEFAULT_SETTINGS[conn][k];
         }
+    }
+    // 已移除的手填代理地址 / 密码：只允许从代理预设中选择
+    for (const k of ['proxyUrl', 'proxyPassword']) {
+        if (Object.hasOwn(s.connCompress, k)) delete s.connCompress[k];
     }
     return s;
 }
@@ -514,7 +525,7 @@ function apiUrlFieldsForSource(settings, source) {
 // ============================================================
 // 说明：这里说的“预设”是 ST 的**代理预设**——即 Connection Profiles 里那条
 // 带 url / 账号密码、用于连接中转的记录，不是破限或提示词预设。
-// 用户既可以从 ST 现有代理预设里挑，也可以手填 url / 密码覆盖。
+// url / 密码只能从 ST 现有代理预设里挑，不允许手填。
 
 // 换源时要清掉的、只对特定源有意义的字段；残留这些字段会让后端报 400。
 const SOURCE_SPECIFIC_FIELDS = Object.freeze([
@@ -584,9 +595,9 @@ async function resolveConnection(s, key) {
     const ctxSettings = SillyTavern.getContext().chatCompletionSettings || {};
     const preset = await findProxyPreset(c.proxyPreset);
 
-    // 优先级：手填 > 代理预设 > 当前连接。手填便于覆盖代理预设里的旧 url/密码。
-    const reverseProxy = String(c.proxyUrl || preset?.url || '').trim();
-    const proxyPassword = String(c.proxyPassword || preset?.password || '');
+    // 只从代理预设取 url / 密码
+    const reverseProxy = String(preset?.url || '').trim();
+    const proxyPassword = String(preset?.password || '');
 
     const warnings = [];
     if (!String(c.source || '').trim()) warnings.push('未选择源，将沿用当前连接的源');
@@ -703,6 +714,59 @@ async function runMainPathTask(ctx, { conn, tag }) {
 
 
 // ============================================================
+//  自动压缩规则
+// ============================================================
+const isRuleAll = (v) => !String(v ?? '').trim() || String(v).trim().toLowerCase() === RULE_ALL;
+
+// 主对话当前使用的代理预设名：优先读 ST 代理下拉，取不到时按当前反代 url 反查
+async function currentProxyPresetName(settings) {
+    const fromDom = String($('#openai_proxy_preset').val() ?? '').trim();
+    if (fromDom) return fromDom;
+    const url = String(settings?.reverse_proxy ?? '').trim();
+    const list = await loadProxyPresets();
+    const hit = list.find(p => p && String(p.url ?? '').trim() === url);
+    return hit?.name || '';
+}
+
+// 判断主对话当前连接是否满足自动压缩规则；返回 { ok, reason }
+async function checkAutoRule(s) {
+    const r = s.autoRule || {};
+    if (isRuleAll(r.source) && isRuleAll(r.proxyPreset) && isRuleAll(r.model)) return { ok: true };
+
+    const ctx = SillyTavern.getContext();
+    if (ctx.mainApi !== 'openai') return { ok: false, reason: `当前 API 不是 Chat Completion（${ctx.mainApi}）` };
+    const settings = ctx.chatCompletionSettings || {};
+    const source = String(settings.chat_completion_source ?? '').trim();
+
+    if (!isRuleAll(r.source) && source.toLowerCase() !== String(r.source).trim().toLowerCase()) {
+        return { ok: false, reason: `补全源 ${source} 不匹配规则 ${r.source}` };
+    }
+    if (!isRuleAll(r.proxyPreset)) {
+        const proxy = await currentProxyPresetName(settings);
+        if (proxy !== String(r.proxyPreset).trim()) {
+            return { ok: false, reason: `代理预设 ${proxy || '(无)'} 不匹配规则 ${r.proxyPreset}` };
+        }
+    }
+    if (!isRuleAll(r.model)) {
+        const model = String(currentModelForSource(settings, source) ?? '');
+        if (!model.toLowerCase().includes(String(r.model).trim().toLowerCase())) {
+            return { ok: false, reason: `模型 ${model || '(无)'} 不包含 ${r.model}` };
+        }
+    }
+    return { ok: true };
+}
+
+// 规则通过才自动压缩
+async function runAutoCompression() {
+    const rule = await checkAutoRule(getSettings());
+    if (!rule.ok) {
+        console.debug(LOG, `自动压缩被规则跳过：${rule.reason}`);
+        return;
+    }
+    await runCompression(undefined, { silent: true, auto: true });
+}
+
+// ============================================================
 //  自动模式：事件监听
 // ============================================================
 function onChatMutated() {
@@ -722,7 +786,7 @@ function onGenerationEnded() {
                     const tokens = await countHistoryTokens();
                     refreshCounterDisplay(tokens);
                     const limit = Math.max(1, Number(s.autoTokens) || 20000);
-                    if (tokens >= limit) await runCompression(undefined, { silent: true, auto: true });
+                    if (tokens >= limit) await runAutoCompression();
                 } catch (e) {
                     console.warn(LOG, '按 token 自动压缩出错：', e);
                 }
@@ -732,7 +796,7 @@ function onGenerationEnded() {
         const every = Math.max(1, Number(s.autoEvery) || 10);
         if (countUserTurns() >= every) {
             // 回复已落库，此刻后台压缩安全
-            setTimeout(() => runCompression(undefined, { silent: true, auto: true }), 500);
+            setTimeout(() => runAutoCompression().catch((e) => console.warn(LOG, '自动压缩出错：', e)), 500);
         }
     } catch (e) {
         console.warn(LOG, 'onGenerationEnded 出错：', e);
@@ -948,18 +1012,7 @@ function buildConnectionHtml(taskId, title, note) {
 
             <label for="${id}_proxy">代理预设</label>
             <select id="${id}_proxy" class="text_pole"></select>
-            <small class="notes">选择 ST 已有的代理预设（自动带出 url 和密码）。下面的手填项会覆盖它。</small>
-
-            <div class="flex-container">
-              <div class="flex1">
-                <label for="${id}_proxy_url">代理地址（手填，可选）</label>
-                <input id="${id}_proxy_url" type="text" class="text_pole" placeholder="留空则用代理预设的 url" />
-              </div>
-              <div class="flex1">
-                <label for="${id}_proxy_pw">代理密码（手填，可选）</label>
-                <input id="${id}_proxy_pw" type="password" class="text_pole" placeholder="留空则用代理预设的密码" />
-              </div>
-            </div>
+            <small class="notes">选择 ST 已有的代理预设（自动带出 url 和密码），不支持手填。</small>
 
             <label for="${id}_model">模型</label>
             <select id="${id}_model" class="text_pole"></select>
@@ -1013,6 +1066,26 @@ function buildSettingsHtml() {
             <span>token 时压缩（当前：<span id="cc_token_counter">0 / 20000</span>）</span>
           </div>
           <small class="notes">关闭自动模式即为手动模式。两种模式下都压缩“上一次压缩点之后”的消息；自动模式开启时也随时可以手动压缩。编辑重发不计入条数。</small>
+
+          <div style="margin-top:8px;"><b>自动压缩规则</b></div>
+          <div class="flex-container">
+            <div class="flex1">
+              <label for="cc_rule_source">补全源</label>
+              <select id="cc_rule_source" class="text_pole">${CC_SOURCES
+                  .map(([v, label]) => v ? `<option value="${v}">${label}</option>` : `<option value="${RULE_ALL}">全部 (all)</option>`)
+                  .join('')}</select>
+            </div>
+            <div class="flex1">
+              <label for="cc_rule_proxy">代理预设</label>
+              <select id="cc_rule_proxy" class="text_pole"></select>
+            </div>
+            <div class="flex1">
+              <label for="cc_rule_model">模型（包含即匹配）</label>
+              <input id="cc_rule_model" type="text" class="text_pole" list="cc_rule_model_list" placeholder="all" />
+              <datalist id="cc_rule_model_list"></datalist>
+            </div>
+          </div>
+          <small class="notes">仅当主对话当前的补全源、代理预设、模型同时满足时才会自动压缩；手动压缩不受限制。all 表示不限。模型为宽松匹配：填 claude 即匹配名称中含 claude 的任何模型（忽略大小写）。</small>
 
           <div class="flex-container" style="margin-top:8px; align-items:center; gap:6px;">
             <input id="cc_run" class="menu_button" type="button" value="立即压缩" />
@@ -1127,6 +1200,17 @@ async function refreshConnectionUI(s, force = false) {
     const settings = ctx.chatCompletionSettings || {};
     const proxies = await loadProxyPresets(force);
 
+    // 自动压缩规则：代理预设下拉 + 模型候选
+    const rule = s.autoRule;
+    const $ruleProxy = $('#cc_rule_proxy').empty().append($('<option>').val(RULE_ALL).text('全部 (all)'));
+    const proxyNames = proxies.filter(p => p && p.name).map(p => p.name);
+    for (const name of proxyNames) $ruleProxy.append($('<option>').val(name).text(name));
+    if (!isRuleAll(rule.proxyPreset) && !proxyNames.includes(rule.proxyPreset)) {
+        $ruleProxy.append($('<option>').val(rule.proxyPreset).text(`${rule.proxyPreset}（未找到）`));
+    }
+    $ruleProxy.val(isRuleAll(rule.proxyPreset) ? RULE_ALL : rule.proxyPreset);
+    refreshRuleModelList(rule);
+
     for (const [taskId, key] of CC_CONN_TASKS) {
         const c = s[key];
         const id = `cc_conn_${taskId}`;
@@ -1146,6 +1230,14 @@ async function refreshConnectionUI(s, force = false) {
     }
 }
 
+// 规则模型输入框的候选：按规则所选源取 ST 已加载的模型列表（all 时取当前源）
+function refreshRuleModelList(rule) {
+    const source = isRuleAll(rule.source) ? '' : rule.source;
+    const $list = $('#cc_rule_model_list').empty();
+    $list.append($('<option>').val(RULE_ALL));
+    for (const name of collectModelCandidates(source, '')) $list.append($('<option>').val(name));
+}
+
 async function refreshUI() {
     const s = getSettings();
     await refreshPresetOptions();
@@ -1154,10 +1246,10 @@ async function refreshUI() {
         const id = `cc_conn_${taskId}`;
         $(`#${id}_enabled`).prop('checked', !!c.enabled);
         $(`#${id}_source`).val(c.source || '');
-        $(`#${id}_proxy_url`).val(c.proxyUrl || '');
-        $(`#${id}_proxy_pw`).val(c.proxyPassword || '');
         // 模型 select 的选项与选中值由 refreshConnectionUI 负责
     }
+    $('#cc_rule_source').val(isRuleAll(s.autoRule.source) ? RULE_ALL : s.autoRule.source);
+    $('#cc_rule_model').val(s.autoRule.model ?? '');
     $('#cc_enabled').prop('checked', s.enabled);
     $('#cc_menu_compress').prop('checked', s.menuCompress);
     $('#cc_auto').prop('checked', s.autoMode);
@@ -1203,12 +1295,19 @@ function bindUI() {
             refreshConnectionUI(s);   // 换源后模型候选跟着变
         });
         $(`#${id}_proxy`).on('change', function () { c().proxyPreset = String($(this).val() ?? ''); save(); });
-        $(`#${id}_proxy_url`).on('input', function () { c().proxyUrl = String($(this).val() ?? ''); save(); });
-        $(`#${id}_proxy_pw`).on('input', function () { c().proxyPassword = String($(this).val() ?? ''); save(); });
         $(`#${id}_model`).on('change', function () { c().model = String($(this).val() ?? ''); save(); });
         // 展开前重读一次 ST 的模型列表，跟上 ST 异步加载进来的 External 模型
         $(`#${id}_model`).on('focus mousedown', function () { refreshModelOptions(taskId, c()); });
     }
+    $('#cc_rule_source').on('change', function () {
+        s.autoRule.source = String($(this).val() || RULE_ALL);
+        save();
+        refreshRuleModelList(s.autoRule);
+    });
+    $('#cc_rule_proxy').on('change', function () { s.autoRule.proxyPreset = String($(this).val() || RULE_ALL); save(); });
+    $('#cc_rule_proxy').on('mousedown focus', () => refreshConnectionUI(s, true));
+    $('#cc_rule_model').on('input', function () { s.autoRule.model = String($(this).val() ?? '').trim() || RULE_ALL; save(); });
+    $('#cc_rule_model').on('focus', () => refreshRuleModelList(s.autoRule));
     $('#cc_prompt').on('input', function () { s.compressPrompt = String($(this).val()); save(); });
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
