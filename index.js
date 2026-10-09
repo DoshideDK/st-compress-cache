@@ -28,6 +28,8 @@ const LEGACY_SETTING_KEYS = Object.freeze([
 let isCompressing = false;
 // 使用主路径预设时，由拦截器以追加 user 消息的方式注入任务指令
 let pendingTaskInjection = null;
+// 用户发起的（非 quiet）生成是否进行中：后台压缩结果需等它结束再写回聊天
+let userGenerating = false;
 
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -135,7 +137,7 @@ function isSummaryMessage(m) {
 //  生成拦截器：注入主路径任务的指令（全局函数，供 manifest 引用）
 // ============================================================
 
-globalThis.compressInterceptor = async function (chat, _contextSize, _abort, _type) {
+globalThis.compressInterceptor = async function (chat, _contextSize, _abort, type) {
     try {
         if (!Array.isArray(chat)) return;
 
@@ -143,7 +145,8 @@ globalThis.compressInterceptor = async function (chat, _contextSize, _abort, _ty
         // ST 的 quiet prompt 固定以 system 角色注入在末尾；部分 OpenAI 兼容中转会把
         // system 上提，导致对话以 assistant 结尾，触发“assistant prefill 不支持”400
         // 错误。以 user 消息结尾对任何源都安全。
-        if (isCompressing && pendingTaskInjection) {
+        // 压缩在后台运行，用户可能同时发消息：只注入到压缩自己的 quiet 生成里
+        if (isCompressing && pendingTaskInjection && type === 'quiet') {
             const ctx = SillyTavern.getContext();
             chat.push({
                 name: ctx?.name1 || 'User',
@@ -311,6 +314,22 @@ async function countHistoryTokens() {
 // ============================================================
 //  压缩执行
 // ============================================================
+function getChatId(ctx) {
+    try { return typeof ctx.getCurrentChatId === 'function' ? ctx.getCurrentChatId() : ctx.chatId; } catch { return undefined; }
+}
+
+function waitUserGenerationIdle(timeoutMs = 10 * 60 * 1000) {
+    if (!userGenerating) return Promise.resolve();
+    const start = Date.now();
+    return new Promise((resolve) => {
+        const tick = () => {
+            if (!userGenerating || Date.now() - start > timeoutMs) return resolve();
+            setTimeout(tick, 300);
+        };
+        tick();
+    });
+}
+
 async function runCompression(countOverride, { silent = false, auto = false } = {}) {
     if (isCompressing) {
         if (!silent) toastr.warning('已有任务在进行中');
@@ -346,8 +365,13 @@ async function runCompression(countOverride, { silent = false, auto = false } = 
         return `${who}: ${m.mes ?? ''}`;
     }).join('\n\n');
 
+    // 后台运行期间聊天可能变化（新消息、删除、切换聊天），记录对象引用和聊天 ID，写回时重新定位
+    const chatIdAtStart = getChatId(ctx);
+    const targetRefs = targets.map((i) => chat[i]);
+    const hideRefs = toHide.map((i) => chat[i]);
+
     let result = '';
-    const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在压缩上下文…' }) : null;
+    if (!silent) toastr.info('压缩已在后台开始，可以继续聊天', '', { timeOut: 2500 });
     isCompressing = true;
     const conn = await resolveConnection(s, 'connCompress');
     if (conn) warnConnection(conn, '压缩');
@@ -380,11 +404,24 @@ async function runCompression(countOverride, { silent = false, auto = false } = 
     } finally {
         isCompressing = false;
         pendingTaskInjection = null;
-        if (loaderHandle) await loaderHandle.hide();
     }
 
     if (!result || !String(result).trim()) {
         if (!silent) toastr.error('压缩失败：模型返回为空');
+        return;
+    }
+
+    // 等用户的生成结束再改聊天，避免和正在流式写入的回复冲突
+    await waitUserGenerationIdle();
+    const ctxNow = SillyTavern.getContext();
+    if (getChatId(ctxNow) !== chatIdAtStart || ctxNow.chat !== chat) {
+        toastr.warning('压缩完成时聊天已切换，结果已丢弃');
+        return;
+    }
+    const liveTargets = targetRefs.map((m) => chat.indexOf(m)).filter((i) => i >= 0).sort((a, b) => a - b);
+    const liveHide = hideRefs.map((m) => chat.indexOf(m)).filter((i) => i >= 0 && chat[i].is_system !== true).sort((a, b) => a - b);
+    if (liveTargets.length === 0) {
+        toastr.warning('压缩期间原消息已被删除，结果已丢弃');
         return;
     }
 
@@ -400,11 +437,11 @@ async function runCompression(countOverride, { silent = false, auto = false } = 
     };
 
     let needReload = false;
-    if (s.hideOriginals) {
+    if (s.hideOriginals && liveHide.length > 0) {
         // 按连续区间分组隐藏，避免 min-max 整段误伤夹在中间的非目标消息（如上一条摘要）
         const runs = [];
-        let runStart = toHide[0], prev = toHide[0];
-        for (const i of toHide.slice(1)) {
+        let runStart = liveHide[0], prev = liveHide[0];
+        for (const i of liveHide.slice(1)) {
             if (i === prev + 1) { prev = i; continue; }
             runs.push([runStart, prev]);
             runStart = prev = i;
@@ -423,13 +460,14 @@ async function runCompression(countOverride, { silent = false, auto = false } = 
             console.warn(LOG, '/hide 调用失败，退回手动隐藏：', e);
         }
         if (!hid) {
-            for (const i of toHide) chat[i].is_system = true;
+            for (const i of liveHide) chat[i].is_system = true;
             needReload = true;
         }
     }
 
     // 保留了最近几条时，摘要插在被压缩范围之后、保留消息之前，保证时间顺序
-    const insertAt = keepLast > 0 ? targets[targets.length - 1] + 1 : chat.length;
+    // 后台期间可能有新消息追加，所以总是插在被压缩范围之后
+    const insertAt = liveTargets[liveTargets.length - 1] + 1;
     if (insertAt < chat.length) {
         chat.splice(insertAt, 0, newMsg);
         needReload = true;
@@ -854,7 +892,7 @@ function syncMenuButtons() {
 function bindMenuHandlers() {
     $(document).on('click', '#option_compress_context', async function () {
         try { $('#options').hide(); } catch { /* ignore */ }
-        await runCompression();
+        runCompression().catch((e) => console.error(LOG, e));
     });
 }
 
@@ -1321,7 +1359,7 @@ function bindUI() {
 
     $('#cc_run').on('click', async function () {
         const n = parseInt($('#cc_run_input').val());
-        await runCompression(Number.isFinite(n) && n > 0 ? n : undefined);
+        runCompression(Number.isFinite(n) && n > 0 ? n : undefined).catch((e) => console.error(LOG, e));
     });
 }
 
@@ -1338,7 +1376,8 @@ function registerSlashCommand() {
             helpString: '压缩上次压缩点之后的消息为一段记忆摘要。/compress 20 则只压缩最近 20 条。',
             callback: async (_named, unnamed) => {
                 const n = parseInt(String(unnamed || '').trim());
-                await runCompression(Number.isFinite(n) && n > 0 ? n : undefined);
+                // 不等待：压缩在后台进行，命令立即返回
+                runCompression(Number.isFinite(n) && n > 0 ? n : undefined).catch((e) => console.error(LOG, e));
                 return '';
             },
             unnamedArgumentList: SlashCommandArgument ? [
@@ -1372,6 +1411,11 @@ jQuery(async () => {
         for (const ev of ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_UPDATED', 'MESSAGE_SWIPED']) {
             if (event_types[ev]) eventSource.on(event_types[ev], onChatMutated);
         }
+        eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
+            if (!dryRun && type !== 'quiet') userGenerating = true;
+        });
+        eventSource.on(event_types.GENERATION_ENDED, () => { userGenerating = false; });
+        if (event_types.GENERATION_STOPPED) eventSource.on(event_types.GENERATION_STOPPED, () => { userGenerating = false; });
         eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
         eventSource.on(event_types.CHAT_CHANGED, () => refreshCounterDisplay());
 
